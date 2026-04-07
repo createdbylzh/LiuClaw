@@ -24,7 +24,7 @@ class CommandCompleter(Completer):
         """根据当前输入生成补全项。"""
 
         text = document.text_before_cursor
-        commands = ["/new", "/resume", "/model", "/thinking", "/compact", "/theme", "/pwd", "/exit", "/sessions", "/help", "/clear", "/retry"]
+        commands = ["/new", "/resume", "/model", "/thinking", "/compact", "/theme", "/pwd", "/exit", "/sessions", "/help", "/clear", "/retry", "/bottom", "/top"]
         if not text.startswith("/"):
             return
         parts = text.split()
@@ -89,16 +89,34 @@ class InteractiveController:
         self.renderer.invalidate()
         try:
             self.session.send_user_message(text)
+            self.state.start_user_turn(text, self.session.current_turn_id)
+            if hasattr(self.renderer, "sync_transcript"):
+                self.renderer.sync_transcript_content(self.state)
+                self.renderer.reconcile_viewport_after_content_change()
             async for event in self.session.run_turn():
-                self.state.apply_event(event)
+                visible_output = self.state.apply_event(event)
+                if visible_output and hasattr(self.renderer, "sync_transcript"):
+                    self.renderer.sync_transcript_content(self.state)
+                    self.renderer.reconcile_viewport_after_content_change()
                 self.renderer.invalidate()
+                if visible_output and hasattr(self.renderer, "follow_output_if_needed"):
+                    self.renderer.follow_output_if_needed()
         except Exception as exc:
             self.state.last_error = str(exc)
-            self.state.apply_event(SessionEvent(type="error", message=str(exc), error=str(exc), panel="error", status_level="error"))
+            visible_output = self.state.apply_event(
+                SessionEvent(type="error", message=str(exc), error=str(exc), panel="error", status_level="error")
+            )
+            if visible_output and hasattr(self.renderer, "sync_transcript"):
+                self.renderer.sync_transcript_content(self.state)
+                self.renderer.reconcile_viewport_after_content_change()
         finally:
             self.state.is_running = False
             self.state.sync_from_session(self.session)
             self.renderer.invalidate()
+            if hasattr(self.renderer, "update_scroll_after_render"):
+                self.renderer.update_scroll_after_render()
+            if hasattr(self.renderer, "focus_input_if_idle"):
+                self.renderer.focus_input_if_idle()
         return 0
 
     async def handle_command(self, text: str) -> None:
@@ -118,6 +136,8 @@ class InteractiveController:
                 resource_loader=self.session.resource_loader,
             )
             self.state.clear_output()
+            if hasattr(self.renderer, "sync_transcript"):
+                self.renderer.sync_transcript(self.state)
             self.state.add_status(f"新会话已创建: {self.session.session_id}")
         elif command == "/resume":
             session_id = args[0] if args else self._default_resume_session_id()
@@ -130,6 +150,8 @@ class InteractiveController:
             self.session.cwd = snapshot.cwd
             self.session.resume_session()
             self.state.clear_output()
+            if hasattr(self.renderer, "sync_transcript"):
+                self.renderer.sync_transcript(self.state)
             self.state.add_status(f"已恢复会话 {session_id}")
         elif command == "/model":
             if not args:
@@ -157,7 +179,10 @@ class InteractiveController:
                 raise ValueError(f"Unknown theme '{theme_name}'")
             self.session.settings.theme = theme_name
             self.state.theme = theme_name
+            self.state.theme_styles = self.state._resolve_theme_styles(self.session)
             self.state.add_status(f"主题已切换为 {theme_name}")
+            if hasattr(self.renderer, "refresh_style"):
+                self.renderer.refresh_style()
         elif command == "/pwd":
             self.state.add_status(str(self.session.cwd))
         elif command == "/sessions":
@@ -184,6 +209,10 @@ class InteractiveController:
             else:
                 if self.renderer.application is not None:
                     self.renderer.application.exit(result=0)
+        elif command == "/bottom":
+            self.jump_to_latest()
+        elif command == "/top":
+            self.jump_to_oldest()
         else:
             self.state.last_error = f"unknown command: {command}"
         self.state.sync_from_session(self.session)
@@ -202,6 +231,8 @@ class InteractiveController:
         """清空输出区域但保留会话状态。"""
 
         self.state.clear_output()
+        if hasattr(self.renderer, "sync_transcript"):
+            self.renderer.sync_transcript_content(self.state)
         self.state.add_status("已清空输出面板")
         self.renderer.invalidate()
 
@@ -245,6 +276,21 @@ class InteractiveController:
 
         self.renderer.scroll_main_page(1)
 
+    def jump_to_latest(self) -> None:
+        """跳转到最新消息并恢复自动跟随。"""
+
+        self.renderer.scroll_main_to_bottom(mark_mode="jumped")
+        self.state.add_status("已回到最新消息")
+        self.renderer.invalidate()
+
+    def jump_to_oldest(self) -> None:
+        """跳转到最早消息并进入历史浏览模式。"""
+
+        if hasattr(self.renderer, "scroll_main_to_top"):
+            self.renderer.scroll_main_to_top()
+        self.state.add_status("已跳到最早消息")
+        self.renderer.invalidate()
+
     def toggle_focus(self) -> None:
         """在主输出区和输入区之间切换焦点。"""
 
@@ -254,4 +300,11 @@ class InteractiveController:
         else:
             self.renderer.focus_input()
             self.state.add_status("焦点已切换到输入区")
+        self.renderer.invalidate()
+
+    def focus_input(self) -> None:
+        """把焦点直接切回输入区。"""
+
+        self.renderer.focus_input()
+        self.state.add_status("焦点已回到输入区")
         self.renderer.invalidate()

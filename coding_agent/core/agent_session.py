@@ -64,6 +64,8 @@ class AgentSession:
         self._follow_up_sent = False
         self._event_message_counter = 0
         self._current_assistant_message_id = ""
+        self._turn_counter = 0
+        self._current_turn_id = ""
         self._agent = Agent(
             AgentOptions(
                 loop=AgentLoopConfig(
@@ -102,6 +104,8 @@ class AgentSession:
     def send_user_message(self, content: str) -> None:
         """接收用户输入，写入会话存储并加入待发送队列。"""
 
+        self._turn_counter += 1
+        self._current_turn_id = f"turn-{self._turn_counter}"
         message = UserMessage(content=content)
         self.session_manager.append_message(
             self.session_id,
@@ -111,6 +115,12 @@ class AgentSession:
         )
         self.last_node_id = self.session_manager.load_session(self.session_id).nodes[-1].id
         self._agent.enqueue(message)
+
+    @property
+    def current_turn_id(self) -> str:
+        """返回当前正在处理的用户轮次 ID。"""
+
+        return self._current_turn_id
 
     def resume_session(self) -> None:
         """从持久化会话恢复历史上下文并同步到底层 Agent。"""
@@ -235,6 +245,8 @@ class AgentSession:
 
         events: list[SessionEvent] = []
         if event.type == "message_start":
+            if event.message is not None and not isinstance(event.message, AssistantMessage):
+                return events
             self._event_message_counter += 1
             self._current_assistant_message_id = f"assistant-{self._event_message_counter}"
             events.append(
@@ -243,6 +255,10 @@ class AgentSession:
                     message="",
                     panel="main",
                     message_id=self._current_assistant_message_id,
+                    turn_id=self._current_turn_id,
+                    source="assistant",
+                    render_group="assistant",
+                    render_order=400,
                 )
             )
             return events
@@ -254,6 +270,10 @@ class AgentSession:
                     panel="main",
                     is_transient=True,
                     message_id=self._current_assistant_message_id,
+                    turn_id=self._current_turn_id,
+                    source="assistant",
+                    render_group="assistant",
+                    render_order=400,
                 )
             )
             return events
@@ -265,6 +285,10 @@ class AgentSession:
                         message=event.message.content,
                         panel="status",
                         status_level="info",
+                        turn_id=self._current_turn_id,
+                        source="steering",
+                        render_group="pre_assistant",
+                        render_order=220,
                         payload={"source": "steering"},
                     )
                 )
@@ -276,6 +300,10 @@ class AgentSession:
                         message="正在基于工具结果继续整理最终答复",
                         panel="status",
                         status_level="info",
+                        turn_id=self._current_turn_id,
+                        source="follow_up",
+                        render_group="pre_assistant",
+                        render_order=320,
                         payload={"source": "follow_up"},
                     )
                 )
@@ -288,6 +316,10 @@ class AgentSession:
                         message=event.message.thinking,
                         panel="thinking",
                         message_id=self._current_assistant_message_id,
+                        turn_id=self._current_turn_id,
+                        source="thinking",
+                        render_group="thinking",
+                        render_order=200,
                     )
                 )
             events.append(
@@ -296,6 +328,10 @@ class AgentSession:
                     message=event.message.content,
                     panel="main",
                     message_id=self._current_assistant_message_id,
+                    turn_id=self._current_turn_id,
+                    source="assistant",
+                    render_group="assistant",
+                    render_order=400,
                 )
             )
             return events
@@ -308,6 +344,10 @@ class AgentSession:
                     status_level="info",
                     tool_arguments=event.toolCall.arguments if event.toolCall else "",
                     message_id=event.toolCall.id if event.toolCall else "",
+                    turn_id=self._current_turn_id,
+                    source="tool",
+                    render_group="pre_assistant",
+                    render_order=250,
                 )
             )
             return events
@@ -323,6 +363,10 @@ class AgentSession:
                     is_transient=True,
                     tool_arguments=event.toolCall.arguments if event.toolCall else "",
                     message_id=event.toolCall.id if event.toolCall else "",
+                    turn_id=self._current_turn_id,
+                    source="tool",
+                    render_group="pre_assistant",
+                    render_order=260,
                 )
             )
             return events
@@ -338,6 +382,10 @@ class AgentSession:
                     status_level="error" if event.error else "success",
                     tool_output_preview=tool_message[:300],
                     message_id=event.toolResult.toolCallId if event.toolResult else "",
+                    turn_id=self._current_turn_id,
+                    source="tool",
+                    render_group="pre_assistant",
+                    render_order=270,
                 )
             )
             return events
@@ -349,6 +397,10 @@ class AgentSession:
                     message=event.error,
                     panel="error",
                     status_level="error",
+                    turn_id=self._current_turn_id,
+                    source="error",
+                    render_group="error",
+                    render_order=500,
                 )
             )
             return events

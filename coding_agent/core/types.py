@@ -123,6 +123,10 @@ class SessionEvent:
     tool_arguments: str = ""
     tool_output_preview: str = ""
     message_id: str = ""
+    turn_id: str = ""
+    source: str = ""
+    render_group: str = ""
+    render_order: int = 0
     payload: dict[str, Any] = field(default_factory=dict)
 
 

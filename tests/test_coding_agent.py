@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 
 import pytest
+from prompt_toolkit.data_structures import Point
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 
 from ai import AssistantMessage, Model, StreamEvent, ToolCall, UserMessage
 from coding_agent.cli import parse_args
@@ -17,10 +19,10 @@ from coding_agent.core.resource_loader import ResourceLoader
 from coding_agent.core.session_manager import SessionManager
 from coding_agent.core.settings_manager import SettingsManager
 from coding_agent.core.tools import build_default_tools
-from coding_agent.core.types import CodingAgentSettings, ToolPolicy
+from coding_agent.core.types import CodingAgentSettings, SessionEvent, ToolPolicy
 from coding_agent.modes.interactive.controller import InteractiveController
 from coding_agent.modes.interactive.renderer import InteractiveRenderer
-from coding_agent.modes.interactive.state import InteractiveState
+from coding_agent.modes.interactive.state import InteractiveState, TranscriptBlock, TranscriptTurn
 
 main_module = importlib.import_module("coding_agent.main")
 
@@ -348,8 +350,13 @@ async def test_interactive_controller_commands(tmp_path: Path, stub_model: Model
         "RendererStub",
         (),
         {
-            "__init__": lambda self: setattr(self, "input_buffer", type("BufferStub", (), {"text": "", "completer": None, "history": None})()) or setattr(self, "application", None),
+            "__init__": lambda self: setattr(self, "input_buffer", type("BufferStub", (), {"text": "", "completer": None, "history": None})()) or setattr(self, "application", None) or setattr(self, "focused_back", False),
             "invalidate": lambda self: None,
+            "sync_transcript": lambda self, state=None: True,
+            "sync_transcript_content": lambda self, state=None: True,
+            "reconcile_viewport_after_content_change": lambda self: None,
+            "focus_input_if_idle": lambda self: setattr(self, "focused_back", True),
+            "refresh_style": lambda self: None,
         },
     )()
     controller = InteractiveController(session, registry, renderer, state)
@@ -366,10 +373,12 @@ async def test_interactive_controller_commands(tmp_path: Path, stub_model: Model
     assert state.thinking == "high"
     assert state.theme == "default"
     assert any("workspace" in item for item in state.status_timeline)
-    assert any(card.body == "ok:hello" for card in state.output_cards)
+    assert "[User]\nhello" in state.transcript_text
+    assert "[Assistant]\nok:hello" in state.transcript_text
     assert any("stub:test" in item for item in state.status_timeline)
+    assert renderer.focused_back is True
     await controller.handle_command("/clear")
-    assert not state.output_cards
+    assert not state.transcript_blocks
 
 
 def test_renderer_keeps_full_history_and_scroll_api() -> None:
@@ -381,14 +390,340 @@ def test_renderer_keeps_full_history_and_scroll_api() -> None:
         theme="default",
     )
     for index in range(30):
-        state.output_cards.append(type("Card", (), {"title": f"Assistant {index}", "body": f"body-{index}", "style": "assistant"})())
+        state.transcript_turns.append(
+            TranscriptTurn(
+                turn_id=f"turn-{index}",
+                user_prompt_preview=f"question-{index}",
+                user_block=TranscriptBlock(id=f"user-{index}", kind="user", title="User", body=f"question-{index}"),
+                assistant_block=TranscriptBlock(
+                    id=f"assistant-{index}",
+                    kind="assistant",
+                    title="Assistant",
+                    body=f"body-{index}",
+                ),
+                completed=True,
+            )
+        )
+    state.rebuild_transcript()
     renderer = InteractiveRenderer(state)
-    fragments = renderer._render_main_panel()
+    renderer.sync_transcript()
 
-    assert any("body-0" in text for _, text in fragments)
-    assert any("body-29" in text for _, text in fragments)
+    assert "body-0" in renderer.transcript_buffer.text
+    assert "body-29" in renderer.transcript_buffer.text
     renderer.scroll_main(3)
     assert renderer.main_window.vertical_scroll == 3
+
+
+def test_interactive_state_tracks_output_follow_and_unseen_updates() -> None:
+    state = InteractiveState(
+        session_id="s1",
+        model_id="stub:test",
+        thinking="medium",
+        cwd=Path("/tmp"),
+        theme="default",
+    )
+    state.start_user_turn("hello", "turn-1")
+    state.apply_event(SessionEvent(type="message_start", message_id="m1"))
+    state.apply_event(SessionEvent(type="message_delta", delta="hello", message_id="m1"))
+    assert state.auto_follow_output is True
+    assert state.unseen_output_updates == 0
+    assert state.transcript_text == "[User]\nhello\n\n[Assistant]\nhello\n"
+
+    state.mark_history_view()
+    state.apply_event(SessionEvent(type="message_delta", delta=" world", message_id="m1"))
+    assert state.auto_follow_output is False
+    assert state.unseen_output_updates == 1
+    assert state.transcript_text == "[User]\nhello\n\n[Assistant]\nhello world\n"
+
+    state.mark_jumped_to_latest()
+    assert state.auto_follow_output is True
+    assert state.unseen_output_updates == 0
+
+
+def test_agent_session_does_not_create_blank_assistant_cards_for_user_message_events(tmp_path: Path, stub_model: Model) -> None:
+    paths = build_agent_paths(tmp_path / "home")
+    paths.ensure_exists()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    resource_loader = ResourceLoader(
+        skills_dir=paths.skills_dir,
+        prompts_dir=paths.prompts_dir,
+        themes_dir=paths.themes_dir,
+        extensions_dir=paths.extensions_dir,
+        workspace_root=workspace,
+    )
+    session_manager = SessionManager(paths.sessions_dir)
+    session = AgentSession(
+        workspace_root=workspace,
+        cwd=workspace,
+        model=stub_model,
+        thinking="medium",
+        settings=CodingAgentSettings(default_model=stub_model.id),
+        session_manager=session_manager,
+        resource_loader=resource_loader,
+    )
+    user_start_events = session._map_event(type("E", (), {"type": "message_start", "message": UserMessage(content="hello")})())
+    assistant_start_events = session._map_event(type("E", (), {"type": "message_start", "message": None})())
+
+    assert user_start_events == []
+    assert len(assistant_start_events) == 1
+
+
+def test_renderer_jump_to_bottom_and_follow_logic() -> None:
+    state = InteractiveState(
+        session_id="s1",
+        model_id="stub:test",
+        thinking="medium",
+        cwd=Path("/tmp"),
+        theme="default",
+    )
+    state.start_user_turn("scroll me", "turn-1")
+    state.apply_event(
+        SessionEvent(
+            type="message_end",
+            message_id="assistant-1",
+            turn_id="turn-1",
+            message="\n".join(f"line-{i}" for i in range(120)),
+        )
+    )
+    state.rebuild_transcript()
+    renderer = InteractiveRenderer(state)
+    renderer.sync_transcript()
+    renderer.main_window.render_info = type("FakeRenderInfo", (), {"window_height": 20})()
+    renderer.main_window.vertical_scroll = 10
+    state.mark_history_view()
+    renderer.scroll_main_to_bottom()
+
+    assert renderer.main_window.vertical_scroll == state.transcript_line_count - 20
+    assert state.auto_follow_output is True
+    assert state.unseen_output_updates == 0
+
+
+def test_renderer_follow_after_render_uses_real_render_info() -> None:
+    state = InteractiveState(
+        session_id="s1",
+        model_id="stub:test",
+        thinking="medium",
+        cwd=Path("/tmp"),
+        theme="default",
+    )
+    state.start_user_turn("scroll me", "turn-1")
+    state.apply_event(
+        SessionEvent(
+            type="message_end",
+            message_id="assistant-1",
+            turn_id="turn-1",
+            message="\n".join(f"line-{i}" for i in range(120)),
+        )
+    )
+    state.rebuild_transcript()
+    renderer = InteractiveRenderer(state)
+    renderer.sync_transcript()
+    renderer.main_window.render_info = type("FakeRenderInfo", (), {"window_height": 20})()
+    renderer.follow_output_if_needed()
+    renderer.update_scroll_after_render()
+
+    assert renderer.main_window.vertical_scroll == state.transcript_line_count - 20
+
+
+def test_interactive_state_builds_transcript_without_blank_assistant_blocks() -> None:
+    state = InteractiveState(
+        session_id="s1",
+        model_id="stub:test",
+        thinking="medium",
+        cwd=Path("/tmp"),
+        theme="default",
+    )
+    state.start_user_turn("inspect file", "turn-1")
+    state.apply_event(SessionEvent(type="status", message="准备执行工具", is_transient=True, panel="status", source="steering", turn_id="turn-1"))
+    state.apply_event(SessionEvent(type="message_start", message_id="a1", turn_id="turn-1"))
+    state.apply_event(SessionEvent(type="message_delta", message_id="a1", delta="first", turn_id="turn-1"))
+    state.apply_event(SessionEvent(type="message_delta", message_id="a1", delta=" second", turn_id="turn-1"))
+    state.apply_event(SessionEvent(type="thinking", message="先分析文件结构", message_id="a1", turn_id="turn-1"))
+    state.apply_event(SessionEvent(type="tool_start", tool_name="read", tool_arguments='{"path":"a.txt"}', message_id="t1", turn_id="turn-1"))
+    state.apply_event(SessionEvent(type="tool_end", tool_name="read", message="ok", tool_output_preview="ok", message_id="t1", turn_id="turn-1"))
+
+    assert state.transcript_text.count("[Assistant]") == 1
+    assert "[Status]\n准备执行工具" in state.transcript_text
+    assert "[Thinking]\n先分析文件结构" in state.transcript_text
+    assert "[Tool:read] success\nargs: {\"path\":\"a.txt\"}\nok" in state.transcript_text
+    assert state.transcript_text.index("[User]") < state.transcript_text.index("[Thinking]") < state.transcript_text.index("[Tool:read] success") < state.transcript_text.index("[Assistant]")
+
+
+def test_renderer_applies_theme_styles_and_focus_returns_to_input() -> None:
+    state = InteractiveState(
+        session_id="s1",
+        model_id="stub:test",
+        thinking="medium",
+        cwd=Path("/tmp"),
+        theme="default",
+        theme_styles={
+            "user": "ansimagenta bold",
+            "assistant_header": "ansicyan bold",
+            "assistant_body": "ansicyan",
+            "thinking_header": "ansiblue bold",
+            "thinking_body": "ansiblue",
+            "tool_header": "ansiyellow bold",
+            "tool_running": "ansiyellow",
+            "tool_success": "ansigreen",
+            "tool_error": "ansired",
+            "status": "ansiwhite",
+            "error": "ansired bold",
+            "status_bar": "reverse",
+            "input_prompt": "ansimagenta",
+        },
+    )
+    state.start_user_turn("hello", "turn-1")
+    state.apply_event(SessionEvent(type="thinking", message="plan", turn_id="turn-1"))
+    state.apply_event(SessionEvent(type="tool_start", tool_name="ls", turn_id="turn-1", message_id="tool-1"))
+    state.apply_event(SessionEvent(type="tool_end", tool_name="ls", turn_id="turn-1", message_id="tool-1", message="done"))
+    state.apply_event(SessionEvent(type="message_end", message="answer", turn_id="turn-1", message_id="assistant-1"))
+    renderer = InteractiveRenderer(state)
+    controller = type(
+        "ControllerStub",
+        (),
+        {
+            "submit_current_buffer": lambda self: None,
+            "cancel_current": lambda self: None,
+            "clear_output": lambda self: None,
+            "autocomplete_buffer": lambda self: None,
+            "show_help": lambda self, message: None,
+            "scroll_main_page_up": lambda self: None,
+            "scroll_main_page_down": lambda self: None,
+            "jump_to_latest": lambda self: None,
+            "jump_to_oldest": lambda self: None,
+            "scroll_main_up": lambda self: None,
+            "scroll_main_down": lambda self: None,
+            "toggle_focus": lambda self: None,
+            "focus_input": lambda self: None,
+        },
+    )()
+    app = renderer.build_application(controller)
+    assert app.layout.current_window is renderer.input_window
+    renderer.focus_main()
+    assert renderer.focused_on_input() is False
+    renderer.focus_input_if_idle()
+    assert renderer.focused_on_input() is True
+    assert renderer._build_style().style_rules
+    assert state.transcript_line_styles[0] == "user"
+
+
+def test_renderer_application_enables_mouse_support() -> None:
+    state = InteractiveState(
+        session_id="s1",
+        model_id="stub:test",
+        thinking="medium",
+        cwd=Path("/tmp"),
+        theme="default",
+    )
+    renderer = InteractiveRenderer(state)
+    controller = type(
+        "ControllerStub",
+        (),
+        {
+            "submit_current_buffer": lambda self: None,
+            "cancel_current": lambda self: None,
+            "clear_output": lambda self: None,
+            "autocomplete_buffer": lambda self: None,
+            "show_help": lambda self, message: None,
+            "scroll_main_page_up": lambda self: None,
+            "scroll_main_page_down": lambda self: None,
+            "jump_to_latest": lambda self: None,
+            "jump_to_oldest": lambda self: None,
+            "scroll_main_up": lambda self: None,
+            "scroll_main_down": lambda self: None,
+            "toggle_focus": lambda self: None,
+        },
+    )()
+    app = renderer.build_application(controller)
+
+    assert app.mouse_support()
+
+
+def test_main_output_mouse_wheel_uses_renderer_scroll_state_machine() -> None:
+    state = InteractiveState(
+        session_id="s1",
+        model_id="stub:test",
+        thinking="medium",
+        cwd=Path("/tmp"),
+        theme="default",
+    )
+    state.start_user_turn("scroll me", "turn-1")
+    state.apply_event(
+        SessionEvent(
+            type="message_end",
+            message_id="assistant-1",
+            turn_id="turn-1",
+            message="\n".join(f"line-{i}" for i in range(200)),
+        )
+    )
+    renderer = InteractiveRenderer(state)
+
+    class FakeRenderInfo:
+        content_height = 220
+        window_height = 20
+        vertical_scroll = 200
+
+    renderer.main_window.render_info = FakeRenderInfo()
+    scroll_calls: list[int] = []
+    original_scroll_main_lines = renderer.scroll_main_lines
+
+    def tracked_scroll(delta: int) -> None:
+        scroll_calls.append(delta)
+        original_scroll_main_lines(delta)
+
+    renderer.scroll_main_lines = tracked_scroll
+
+    event_up = MouseEvent(position=Point(x=0, y=0), event_type=MouseEventType.SCROLL_UP, button=MouseButton.NONE, modifiers=frozenset())
+    event_down = MouseEvent(position=Point(x=0, y=0), event_type=MouseEventType.SCROLL_DOWN, button=MouseButton.NONE, modifiers=frozenset())
+
+    assert renderer.main_control.mouse_handler(event_up) is None
+    assert scroll_calls[-1] == -3
+    assert state.main_view_mode == "history"
+
+    FakeRenderInfo.vertical_scroll = 197
+    assert renderer.main_control.mouse_handler(event_down) is None
+    assert scroll_calls[-1] == 3
+
+
+def test_main_output_mouse_wheel_does_not_require_focus_change() -> None:
+    state = InteractiveState(
+        session_id="s1",
+        model_id="stub:test",
+        thinking="medium",
+        cwd=Path("/tmp"),
+        theme="default",
+    )
+    renderer = InteractiveRenderer(state)
+    controller = type(
+        "ControllerStub",
+        (),
+        {
+            "submit_current_buffer": lambda self: None,
+            "cancel_current": lambda self: None,
+            "clear_output": lambda self: None,
+            "autocomplete_buffer": lambda self: None,
+            "show_help": lambda self, message: None,
+            "scroll_main_page_up": lambda self: None,
+            "scroll_main_page_down": lambda self: None,
+            "jump_to_latest": lambda self: None,
+            "jump_to_oldest": lambda self: None,
+            "scroll_main_up": lambda self: None,
+            "scroll_main_down": lambda self: None,
+            "toggle_focus": lambda self: None,
+            "focus_input": lambda self: None,
+        },
+    )()
+    app = renderer.build_application(controller)
+    assert app.layout.current_window is renderer.input_window
+    called: list[str] = []
+    renderer.handle_main_mouse_scroll = lambda direction: called.append(direction)
+    event_up = MouseEvent(position=Point(x=0, y=0), event_type=MouseEventType.SCROLL_UP, button=MouseButton.NONE, modifiers=frozenset())
+
+    renderer.main_control.mouse_handler(event_up)
+
+    assert called == ["up"]
+    assert app.layout.current_window is renderer.input_window
 
 
 def test_model_registry_cli_and_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
