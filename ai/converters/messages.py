@@ -1,0 +1,80 @@
+from __future__ import annotations
+
+from typing import Any
+
+from ..types import AssistantMessage, Context, ToolCall, ToolResultMessage, UserMessage, ensure_context
+from .tools import convert_tools_for_provider
+
+_KNOWN_PROVIDERS = {"openai", "anthropic", "zhipu"}
+
+
+def convert_context_for_provider(model: Any, context: Context | dict[str, Any]) -> Context:
+    """将统一 `Context` 转换为目标 provider 可消费的兼容上下文。"""
+
+    normalized = ensure_context(context)
+    provider = getattr(model, "provider", None)
+    if provider not in _KNOWN_PROVIDERS:
+        return normalized
+    return Context(
+        systemPrompt=normalized.systemPrompt,
+        messages=convert_messages_for_provider(normalized.messages, target_provider=provider),
+        tools=convert_tools_for_provider(normalized.tools, target_provider=provider),
+    )
+
+
+
+def convert_messages_for_provider(messages: list[Any], target_provider: str | None) -> list[Any]:
+    """将历史消息转换为目标 provider 兼容的统一消息对象。"""
+
+    return [_convert_message(target_provider, message) for message in messages]
+
+
+
+def _convert_message(provider: str | None, message: Any) -> Any:
+    """把单条统一消息转换为目标 provider 兼容的表示。"""
+
+    if isinstance(message, UserMessage):
+        return UserMessage(content=message.content, metadata=dict(message.metadata))
+    if isinstance(message, ToolResultMessage):
+        metadata = dict(message.metadata)
+        metadata["targetProvider"] = provider
+        return ToolResultMessage(
+            toolCallId=message.toolCallId,
+            toolName=message.toolName,
+            content=message.content,
+            metadata=metadata,
+        )
+    if isinstance(message, AssistantMessage):
+        return _convert_assistant_message(provider, message)
+    return message
+
+
+
+def _convert_assistant_message(provider: str | None, message: AssistantMessage) -> AssistantMessage:
+    """把 assistant 历史消息转换为目标 provider 兼容的统一表示。"""
+
+    metadata = dict(message.metadata)
+    metadata["targetProvider"] = provider
+    if provider in _KNOWN_PROVIDERS and message.thinking:
+        metadata.setdefault("historicalThinking", message.thinking)
+
+    return AssistantMessage(
+        content=message.content,
+        thinking=message.thinking,
+        toolCalls=[_convert_tool_call(provider, tool_call) for tool_call in message.toolCalls],
+        metadata=metadata,
+    )
+
+
+
+def _convert_tool_call(provider: str | None, tool_call: ToolCall) -> ToolCall:
+    """把历史工具调用转换为目标 provider 兼容的统一工具调用。"""
+
+    metadata = dict(tool_call.metadata)
+    metadata["targetProvider"] = provider
+    return ToolCall(
+        id=tool_call.id,
+        name=tool_call.name,
+        arguments=tool_call.arguments,
+        metadata=metadata,
+    )

@@ -1,0 +1,257 @@
+from __future__ import annotations
+
+import asyncio
+import shlex
+from collections.abc import Iterable
+
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.history import InMemoryHistory
+
+from ...core import AgentSession, ModelRegistry
+from ...core.types import SessionEvent
+from .state import InteractiveState
+
+
+class CommandCompleter(Completer):
+    """为斜杠命令和部分参数提供补全。"""
+
+    def __init__(self, controller: "InteractiveController") -> None:
+        """初始化补全器。"""
+
+        self.controller = controller
+
+    def get_completions(self, document, complete_event):
+        """根据当前输入生成补全项。"""
+
+        text = document.text_before_cursor
+        commands = ["/new", "/resume", "/model", "/thinking", "/compact", "/theme", "/pwd", "/exit", "/sessions", "/help", "/clear", "/retry"]
+        if not text.startswith("/"):
+            return
+        parts = text.split()
+        if len(parts) <= 1:
+            for command in commands:
+                if command.startswith(text):
+                    yield Completion(command, start_position=-len(text))
+            return
+        command = parts[0]
+        current = parts[-1]
+        candidates: Iterable[str] = []
+        if command == "/model":
+            candidates = [model.id for model in self.controller.model_registry.list()]
+        elif command == "/resume":
+            candidates = [item["session_id"] for item in self.controller.session_manager.list_recent_sessions(limit=20)]
+        elif command == "/theme":
+            candidates = list(self.controller.session.resource_loader.load().themes.keys())
+        elif command == "/thinking":
+            candidates = ["low", "medium", "high"]
+        for candidate in candidates:
+            if candidate.startswith(current):
+                yield Completion(candidate, start_position=-len(current))
+
+
+class InteractiveController:
+    """负责连接输入、会话运行与界面状态。"""
+
+    def __init__(self, session: AgentSession, model_registry: ModelRegistry, renderer, state: InteractiveState) -> None:
+        """初始化控制器与状态引用。"""
+
+        self.session = session
+        self.model_registry = model_registry
+        self.session_manager = session.session_manager
+        self.renderer = renderer
+        self.state = state
+        self.history = InMemoryHistory()
+        self.completer = CommandCompleter(self)
+        self._current_task: asyncio.Task[int] | None = None
+        if hasattr(self.renderer, "input_buffer"):
+            self.renderer.input_buffer.completer = self.completer
+            self.renderer.input_buffer.history = self.history
+
+    def submit_current_buffer(self) -> None:
+        """提交输入缓冲区中的内容。"""
+
+        text = self.renderer.input_buffer.text.strip()
+        if not text or self.state.is_running:
+            return
+        self.renderer.input_buffer.text = ""
+        self._current_task = asyncio.create_task(self.handle_text(text))
+
+    async def handle_text(self, text: str) -> int:
+        """处理一条用户输入或斜杠命令。"""
+
+        if text.startswith("/"):
+            await self.handle_command(text)
+            self.renderer.invalidate()
+            return 0
+        self.state.is_running = True
+        self.state.last_error = ""
+        self.state.add_status("发送用户消息")
+        self.renderer.invalidate()
+        try:
+            self.session.send_user_message(text)
+            async for event in self.session.run_turn():
+                self.state.apply_event(event)
+                self.renderer.invalidate()
+        except Exception as exc:
+            self.state.last_error = str(exc)
+            self.state.apply_event(SessionEvent(type="error", message=str(exc), error=str(exc), panel="error", status_level="error"))
+        finally:
+            self.state.is_running = False
+            self.state.sync_from_session(self.session)
+            self.renderer.invalidate()
+        return 0
+
+    async def handle_command(self, text: str) -> None:
+        """执行斜杠命令。"""
+
+        parts = shlex.split(text)
+        command = parts[0]
+        args = parts[1:]
+        if command == "/new":
+            self.session = AgentSession(
+                workspace_root=self.session.workspace_root,
+                cwd=self.session.cwd,
+                model=self.session.model,
+                thinking=self.session.thinking,
+                settings=self.session.settings,
+                session_manager=self.session_manager,
+                resource_loader=self.session.resource_loader,
+            )
+            self.state.clear_output()
+            self.state.add_status(f"新会话已创建: {self.session.session_id}")
+        elif command == "/resume":
+            session_id = args[0] if args else self._default_resume_session_id()
+            if session_id is None:
+                self.state.last_error = "没有可恢复的会话"
+                return
+            snapshot = self.session_manager.load_session(session_id)
+            self.session.session_id = session_id
+            self.session.branch_id = snapshot.branch_id
+            self.session.cwd = snapshot.cwd
+            self.session.resume_session()
+            self.state.clear_output()
+            self.state.add_status(f"已恢复会话 {session_id}")
+        elif command == "/model":
+            if not args:
+                self.show_help("用法: /model <model_id>")
+                return
+            model = self.model_registry.get(args[0])
+            self.session.switch_model(model)
+            self.state.add_status(f"模型已切换为 {model.id}")
+        elif command == "/thinking":
+            if not args:
+                self.show_help("用法: /thinking <low|medium|high>")
+                return
+            self.session.set_thinking(args[0])
+            self.state.add_status(f"思考等级已切换为 {args[0]}")
+        elif command == "/compact":
+            result = self.session.compact()
+            self.state.add_status(f"已压缩 {result.compacted_count} 条历史消息")
+        elif command == "/theme":
+            if not args:
+                self.show_help("用法: /theme <theme_name>")
+                return
+            theme_name = args[0]
+            themes = self.session.resource_loader.load().themes
+            if theme_name not in themes:
+                raise ValueError(f"Unknown theme '{theme_name}'")
+            self.session.settings.theme = theme_name
+            self.state.theme = theme_name
+            self.state.add_status(f"主题已切换为 {theme_name}")
+        elif command == "/pwd":
+            self.state.add_status(str(self.session.cwd))
+        elif command == "/sessions":
+            recent = self.session_manager.list_recent_sessions(limit=10)
+            if not recent:
+                self.state.add_status("暂无最近会话")
+            for item in recent:
+                self.state.add_status(f"{item['session_id']} | {item.get('title', '')} | {item.get('model_id', '')}")
+        elif command == "/help":
+            self.show_help(
+                "Commands: /new /resume [id] /model <id> /thinking <level> /compact /theme <name> /pwd /sessions /clear /retry /exit"
+            )
+        elif command == "/clear":
+            self.clear_output()
+        elif command == "/retry":
+            last_message = self.session.get_last_user_message()
+            if not last_message:
+                self.state.add_status("没有可重试的用户消息")
+            else:
+                await self.handle_text(last_message)
+        elif command == "/exit":
+            if self.state.is_running:
+                self.state.add_status("正在运行中，请先 Ctrl-C 取消再退出")
+            else:
+                if self.renderer.application is not None:
+                    self.renderer.application.exit(result=0)
+        else:
+            self.state.last_error = f"unknown command: {command}"
+        self.state.sync_from_session(self.session)
+
+    def cancel_current(self) -> None:
+        """取消当前会话执行任务。"""
+
+        if self._current_task is not None and not self._current_task.done():
+            self.session.cancel()
+            self._current_task.cancel()
+            self.state.is_running = False
+            self.state.add_status("已取消当前运行")
+            self.renderer.invalidate()
+
+    def clear_output(self) -> None:
+        """清空输出区域但保留会话状态。"""
+
+        self.state.clear_output()
+        self.state.add_status("已清空输出面板")
+        self.renderer.invalidate()
+
+    def autocomplete_buffer(self) -> None:
+        """触发输入缓冲区补全。"""
+
+        if self.renderer.application is not None:
+            self.renderer.application.current_buffer.start_completion(select_first=False)
+
+    def show_help(self, message: str) -> None:
+        """在状态栏中显示帮助说明。"""
+
+        self.state.add_status(message)
+        self.renderer.invalidate()
+
+    def _default_resume_session_id(self) -> str | None:
+        """返回默认用于恢复的最近会话 ID。"""
+
+        recent = self.session.list_recent_sessions(limit=1)
+        if not recent:
+            return None
+        return recent[0]["session_id"]
+
+    def scroll_main_up(self) -> None:
+        """向上滚动主输出区一行。"""
+
+        self.renderer.scroll_main(-1)
+
+    def scroll_main_down(self) -> None:
+        """向下滚动主输出区一行。"""
+
+        self.renderer.scroll_main(1)
+
+    def scroll_main_page_up(self) -> None:
+        """向上滚动主输出区一页。"""
+
+        self.renderer.scroll_main_page(-1)
+
+    def scroll_main_page_down(self) -> None:
+        """向下滚动主输出区一页。"""
+
+        self.renderer.scroll_main_page(1)
+
+    def toggle_focus(self) -> None:
+        """在主输出区和输入区之间切换焦点。"""
+
+        if self.renderer.focused_on_input():
+            self.renderer.focus_main()
+            self.state.add_status("焦点已切换到主输出区")
+        else:
+            self.renderer.focus_input()
+            self.state.add_status("焦点已切换到输入区")
+        self.renderer.invalidate()

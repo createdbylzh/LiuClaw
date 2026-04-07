@@ -1,0 +1,115 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from ai.options import Options
+from ai.types import AssistantMessage, Context, Model, ToolResultMessage, UserMessage
+
+
+class ContextOverflowError(ValueError):
+    """表示上下文估算后已超出模型窗口限制。"""
+
+
+@dataclass(slots=True)
+class ContextOverflowReport:
+    """描述一次上下文窗口检测的结果。"""
+
+    estimated_tokens: int
+    requested_output_tokens: int
+    total_tokens: int
+    limit: int
+
+    @property
+    def is_overflow(self) -> bool:
+        """返回当前预算是否已经超出窗口上限。"""
+
+        return self.total_tokens > self.limit
+
+
+
+def estimate_context_tokens(context: Context) -> int:
+    """粗略估算统一 `Context` 占用的 token 数。"""
+
+    total = 0
+    if context.systemPrompt:
+        total += _estimate_text_tokens(context.systemPrompt)
+
+    for message in context.messages:
+        total += _estimate_message_tokens(message)
+
+    for tool in context.tools:
+        total += _estimate_text_tokens(_tool_value(tool, "name", ""))
+        total += _estimate_text_tokens(_tool_value(tool, "description", "") or "")
+        total += _estimate_text_tokens(str(_tool_value(tool, "inputSchema", {})))
+
+    return total
+
+
+
+def detect_context_overflow(model: Model, context: Context, options: Options | None = None) -> ContextOverflowReport:
+    """检测上下文是否会超过模型窗口，并返回检测结果。"""
+
+    estimated_tokens = estimate_context_tokens(context)
+    requested_output_tokens = 0
+    if options is not None and options.maxTokens is not None:
+        requested_output_tokens = options.maxTokens
+    elif model.maxOutputTokens:
+        requested_output_tokens = model.maxOutputTokens
+
+    total_budget = estimated_tokens + requested_output_tokens
+    return ContextOverflowReport(
+        estimated_tokens=estimated_tokens,
+        requested_output_tokens=requested_output_tokens,
+        total_tokens=total_budget,
+        limit=model.contextWindow,
+    )
+
+
+
+def ensure_context_fits_window(model: Model, context: Context, options: Options | None = None) -> ContextOverflowReport:
+    """在超出模型窗口时抛错，否则返回检测结果。"""
+
+    report = detect_context_overflow(model, context, options)
+    if report.is_overflow:
+        raise ContextOverflowError(
+            f"context exceeds model window: estimated={report.estimated_tokens}, "
+            f"requested_output={report.requested_output_tokens}, "
+            f"limit={report.limit}"
+        )
+    return report
+
+
+
+def _estimate_message_tokens(message: UserMessage | AssistantMessage | ToolResultMessage) -> int:
+    """粗略估算一条消息占用的 token 数。"""
+
+    total = _estimate_text_tokens(message.content)
+    if isinstance(message, AssistantMessage):
+        total += _estimate_text_tokens(message.thinking)
+        for tool_call in message.toolCalls:
+            total += _estimate_text_tokens(tool_call.id)
+            total += _estimate_text_tokens(tool_call.name)
+            total += _estimate_text_tokens(tool_call.arguments)
+    elif isinstance(message, ToolResultMessage):
+        total += _estimate_text_tokens(message.toolCallId)
+        total += _estimate_text_tokens(message.toolName)
+    return total
+
+
+
+def _estimate_text_tokens(text: str) -> int:
+    """用保守近似方法估算文本 token 数。"""
+
+    if not text:
+        return 0
+    return max(1, (len(text) + 2) // 3)
+
+
+
+def _tool_value(tool: Any, key: str, default: Any) -> Any:
+    """兼容读取工具对象或工具字典中的字段。"""
+
+    if isinstance(tool, dict):
+        return tool.get(key, default)
+    return getattr(tool, key, default)

@@ -1,0 +1,25 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """构造 coding-agent 命令行参数解析器。"""
+
+    parser = argparse.ArgumentParser(prog="coding-agent")
+    parser.add_argument("prompt", nargs="?", help="Optional one-shot prompt.")
+    parser.add_argument("--model")
+    parser.add_argument("--session")
+    parser.add_argument("--cwd", type=Path, default=Path.cwd())
+    parser.add_argument("--thinking", choices=["low", "medium", "high"])
+    parser.add_argument("--new", action="store_true", help="Create a new session.")
+    parser.add_argument("--compact", action="store_true", help="Compact the active session and exit.")
+    parser.add_argument("--theme")
+    return parser
+
+
+def parse_args(argv: list[str] | None = None):
+    """解析命令行参数并返回结果对象。"""
+
+    return build_parser().parse_args(argv)

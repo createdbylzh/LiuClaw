@@ -1,0 +1,529 @@
+from __future__ import annotations
+
+import asyncio
+import inspect
+from collections.abc import Awaitable
+from dataclasses import dataclass, field, replace
+from typing import Any, Protocol
+
+from ai.session import StreamSession
+from ai.types import AssistantMessage, ConversationMessage, ToolCall, ensure_message, ensure_model
+
+from .agent_loop import _createAgentLoopSession, agentLoop, agentLoopContinue
+from .types import AgentEvent, AgentLoopConfig, AgentState
+
+
+class AgentEventListener(Protocol):
+    """定义高层 Agent 事件监听器的统一签名。"""
+
+    def __call__(self, event: AgentEvent) -> None | Awaitable[None]:
+        """消费一条已经过 Agent 状态同步的事件。"""
+
+
+@dataclass(slots=True)
+class AgentOptions:
+    """定义创建高层 Agent 时使用的配置选项。"""
+
+    loop: AgentLoopConfig
+    initialState: AgentState | None = None
+    listeners: list[AgentEventListener] = field(default_factory=list)
+    pendingMessages: list[ConversationMessage | dict[str, Any]] = field(default_factory=list)
+    steeringMessages: list[ConversationMessage | dict[str, Any]] = field(default_factory=list)
+    followUpMessages: list[ConversationMessage | dict[str, Any]] = field(default_factory=list)
+    autoCopyState: bool = True
+
+
+def _copy_state(state: AgentState) -> AgentState:
+    """复制一个 AgentState，避免高层与外部共享可变引用。"""
+
+    return AgentState(
+        systemPrompt=state.systemPrompt,
+        model=state.model,
+        thinking=state.thinking,
+        tools=[replace(tool) for tool in state.tools],
+        history=[replace(message) for message in state.history],
+        isStreaming=state.isStreaming,
+        currentMessage=replace(state.currentMessage) if state.currentMessage is not None else None,
+        runningToolCall=replace(state.runningToolCall) if state.runningToolCall is not None else None,
+        error=state.error,
+    )
+
+
+def _build_initial_state(loop: AgentLoopConfig) -> AgentState:
+    """根据 loop 配置构造一个新的初始状态。"""
+
+    if loop.model is None:
+        raise ValueError("AgentLoopConfig.model is required")
+    return AgentState(
+        systemPrompt=loop.systemPrompt,
+        model=ensure_model(loop.model),
+        thinking=loop.thinking,
+        tools=[replace(tool) for tool in loop.tools],
+        history=[],
+        isStreaming=False,
+        currentMessage=None,
+        runningToolCall=None,
+        error=None,
+    )
+
+
+class Agent:
+    """面向高层业务的 Agent 运行时封装。"""
+
+    def __init__(self, options: AgentOptions | AgentLoopConfig) -> None:
+        """根据 AgentOptions 或 AgentLoopConfig 初始化高层 Agent。
+
+        参数：
+        - `options`：可直接传 `AgentOptions`，也可直接传 `AgentLoopConfig` 作为简写。
+        """
+
+        resolved_options = options if isinstance(options, AgentOptions) else AgentOptions(loop=options)
+        self._options = resolved_options
+        self._loop = resolved_options.loop
+        self._listeners: list[AgentEventListener] = list(resolved_options.listeners)
+        self._pendingMessages: list[ConversationMessage] = [
+            ensure_message(message) for message in resolved_options.pendingMessages
+        ]
+        self._steeringMessages: list[ConversationMessage] = [
+            ensure_message(message) for message in resolved_options.steeringMessages
+        ]
+        self._followUpMessages: list[ConversationMessage] = [
+            ensure_message(message) for message in resolved_options.followUpMessages
+        ]
+        self._currentSession: StreamSession[AgentEvent] | None = None
+        self._currentTask: asyncio.Task[None] | None = None
+        self._cancelRequested = False
+        self._isRunning = False
+        if resolved_options.initialState is not None:
+            self.state = _copy_state(resolved_options.initialState) if resolved_options.autoCopyState else resolved_options.initialState
+        else:
+            self.state = _build_initial_state(self._loop)
+
+    @property
+    def isRunning(self) -> bool:
+        """返回当前 Agent 是否处于运行中。"""
+
+        return self._isRunning
+
+    @property
+    def lastMessage(self) -> AssistantMessage | None:
+        """返回历史中最近一条 assistant 消息。"""
+
+        for message in reversed(self.state.history):
+            if isinstance(message, AssistantMessage):
+                return message
+        return None
+
+    @property
+    def pendingMessages(self) -> list[ConversationMessage]:
+        """返回当前普通待处理消息队列的副本。"""
+
+        return [replace(message) for message in self._pendingMessages]
+
+    @property
+    def steeringMessages(self) -> list[ConversationMessage]:
+        """返回当前 steering 消息队列的副本。"""
+
+        return [replace(message) for message in self._steeringMessages]
+
+    @property
+    def followUpMessages(self) -> list[ConversationMessage]:
+        """返回当前 follow-up 消息队列的副本。"""
+
+        return [replace(message) for message in self._followUpMessages]
+
+    @property
+    def listeners(self) -> list[AgentEventListener]:
+        """返回当前监听器列表的副本。"""
+
+        return list(self._listeners)
+
+    @property
+    def currentSession(self) -> StreamSession[AgentEvent] | None:
+        """返回当前对外暴露的事件流会话。"""
+
+        return self._currentSession
+
+    @property
+    def currentTask(self) -> asyncio.Task[None] | None:
+        """返回当前桥接底层循环的后台任务。"""
+
+        return self._currentTask
+
+    def getState(self) -> AgentState:
+        """返回当前 AgentState 的快照。"""
+
+        return _copy_state(self.state)
+
+    def setState(self, state: AgentState) -> None:
+        """直接替换整个 AgentState。
+
+        异常：
+        - 运行中调用会抛出 `RuntimeError`。
+        """
+
+        if self._isRunning:
+            raise RuntimeError("Cannot set state while Agent is running")
+        self.state = _copy_state(state)
+
+    def updateState(self, **kwargs: Any) -> None:
+        """局部更新 AgentState 字段。
+
+        异常：
+        - 运行中修改关键运行字段会抛出 `RuntimeError`。
+        """
+
+        restricted = {"isStreaming", "currentMessage", "runningToolCall"}
+        if self._isRunning and restricted.intersection(kwargs):
+            raise RuntimeError("Cannot update runtime-only state fields while Agent is running")
+        for key, value in kwargs.items():
+            setattr(self.state, key, value)
+
+    def setThinking(self, thinking) -> None:
+        """设置高层 Agent 的思考级别。"""
+
+        self.state.thinking = thinking
+        self._loop.thinking = thinking
+
+    def setSystemPrompt(self, prompt: str | None) -> None:
+        """设置系统提示词，并同步到 loop 配置。"""
+
+        self.state.systemPrompt = prompt
+        self._loop.systemPrompt = prompt
+
+    def setModel(self, model) -> None:
+        """设置当前模型，并同步到 loop 配置。"""
+
+        self.state.model = ensure_model(model)
+        self._loop.model = self.state.model
+
+    def setTools(self, tools) -> None:
+        """设置可用工具列表，并同步到 loop 配置。"""
+
+        copied_tools = [replace(tool) for tool in tools]
+        self.state.tools = copied_tools
+        self._loop.tools = [replace(tool) for tool in copied_tools]
+
+    def subscribe(self, listener: AgentEventListener) -> None:
+        """注册一个新的事件监听器。"""
+
+        self._listeners.append(listener)
+
+    def unsubscribe(self, listener: AgentEventListener) -> None:
+        """移除一个已注册的事件监听器。"""
+
+        self._listeners = [item for item in self._listeners if item is not listener]
+
+    def clearListeners(self) -> None:
+        """清空全部事件监听器。"""
+
+        self._listeners.clear()
+
+    def enqueue(
+        self,
+        message: ConversationMessage | dict[str, Any] | list[ConversationMessage | dict[str, Any]],
+    ) -> None:
+        """向普通待处理消息队列追加一条或多条消息。"""
+
+        items = message if isinstance(message, list) else [message]
+        self._pendingMessages.extend(ensure_message(item) for item in items)
+
+    def enqueueSteering(
+        self,
+        message: ConversationMessage | dict[str, Any] | list[ConversationMessage | dict[str, Any]],
+    ) -> None:
+        """向 steering 队列追加一条或多条中途插话消息。"""
+
+        items = message if isinstance(message, list) else [message]
+        self._steeringMessages.extend(ensure_message(item) for item in items)
+
+    def enqueueFollowUp(
+        self,
+        message: ConversationMessage | dict[str, Any] | list[ConversationMessage | dict[str, Any]],
+    ) -> None:
+        """向 follow-up 队列追加一条或多条任务后处理消息。"""
+
+        items = message if isinstance(message, list) else [message]
+        self._followUpMessages.extend(ensure_message(item) for item in items)
+
+    async def send(
+        self,
+        message: ConversationMessage | dict[str, Any] | list[ConversationMessage | dict[str, Any]],
+    ) -> None:
+        """兼容旧接口，等价于 `enqueue()`。"""
+
+        self.enqueue(message)
+
+    def dequeueAll(self) -> list[ConversationMessage]:
+        """取出并清空全部普通待处理消息。"""
+
+        messages = [replace(message) for message in self._pendingMessages]
+        self._pendingMessages.clear()
+        return messages
+
+    def dequeueSteeringAll(self) -> list[ConversationMessage]:
+        """取出并清空全部 steering 消息。"""
+
+        messages = [replace(message) for message in self._steeringMessages]
+        self._steeringMessages.clear()
+        return messages
+
+    def dequeueFollowUpAll(self) -> list[ConversationMessage]:
+        """取出并清空全部 follow-up 消息。"""
+
+        messages = [replace(message) for message in self._followUpMessages]
+        self._followUpMessages.clear()
+        return messages
+
+    def clearQueue(self) -> None:
+        """清空普通待处理消息队列。"""
+
+        self._pendingMessages.clear()
+
+    def clearSteeringQueue(self) -> None:
+        """清空 steering 消息队列。"""
+
+        self._steeringMessages.clear()
+
+    def clearFollowUpQueue(self) -> None:
+        """清空 follow-up 消息队列。"""
+
+        self._followUpMessages.clear()
+
+    def queueSize(self) -> int:
+        """返回当前普通待处理消息数量。"""
+
+        return len(self._pendingMessages)
+
+    def steeringQueueSize(self) -> int:
+        """返回当前 steering 消息数量。"""
+
+        return len(self._steeringMessages)
+
+    def followUpQueueSize(self) -> int:
+        """返回当前 follow-up 消息数量。"""
+
+        return len(self._followUpMessages)
+
+    def cancel(self) -> None:
+        """取消当前运行中的循环，但保留历史消息。"""
+
+        self._cancelRequested = True
+        if self._currentSession is not None:
+            self._currentSession.producer_task.cancel()
+        if self._currentTask is not None:
+            self._currentTask.cancel()
+
+    async def wait(self) -> None:
+        """等待当前运行中的会话结束。"""
+
+        if self._currentSession is not None:
+            await self._currentSession.wait_closed()
+        if self._currentTask is None or self._currentTask.done():
+            self._isRunning = False
+            self._cancelRequested = False
+            self._currentSession = None
+            self._currentTask = None
+            self.state.isStreaming = False
+
+    def reset(self) -> None:
+        """重置状态、队列和运行控制。"""
+
+        if self._isRunning:
+            raise RuntimeError("Cannot reset an Agent while it is running")
+        self._pendingMessages.clear()
+        self._steeringMessages.clear()
+        self._followUpMessages.clear()
+        self._currentSession = None
+        self._currentTask = None
+        self._cancelRequested = False
+        self.state = _build_initial_state(self._loop)
+
+    async def prompt(
+        self,
+        message: ConversationMessage | dict[str, Any] | list[ConversationMessage | dict[str, Any]],
+    ) -> StreamSession[AgentEvent]:
+        """追加消息并立即启动一轮循环。"""
+
+        self.enqueue(message)
+        return await self.run()
+
+    async def continueConversation(self) -> StreamSession[AgentEvent]:
+        """从当前上下文继续对话，不添加新消息。"""
+
+        return await self._runLoopSession(continueOnly=True)
+
+    async def resume(self) -> StreamSession[AgentEvent]:
+        """作为 `continueConversation()` 的兼容别名。"""
+
+        return await self.continueConversation()
+
+    async def run(self) -> StreamSession[AgentEvent]:
+        """根据当前队列或历史状态启动一次高层运行。"""
+
+        has_pending_messages = bool(self._pendingMessages)
+        return await self._runLoopSession(
+            newMessages=self.dequeueAll() if has_pending_messages else None,
+            continueOnly=not has_pending_messages,
+        )
+
+    async def _emit_to_listeners(self, event: AgentEvent) -> None:
+        """按注册顺序把事件分发给全部监听器。"""
+
+        for listener in list(self._listeners):
+            try:
+                result = listener(event)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:
+                self.state.error = str(exc)
+
+    async def emit(self, event: AgentEvent, queue: asyncio.Queue[AgentEvent]) -> None:
+        """把已处理事件分发给监听器并写入高层事件流。"""
+
+        await self._emit_to_listeners(event)
+        await queue.put(event)
+
+    def _handleLoopEvent(self, event: AgentEvent) -> AgentEvent:
+        """处理底层循环事件，更新内部状态并返回事件本身。"""
+
+        if event.state is not None:
+            self.state = _copy_state(event.state)
+
+        if event.type == "agent_start":
+            self.state.error = None
+        elif event.type == "message_start":
+            if isinstance(event.message, AssistantMessage):
+                self.state.currentMessage = replace(event.message)
+        elif event.type == "message_end":
+            if isinstance(event.message, AssistantMessage):
+                self.state.currentMessage = replace(event.message)
+        elif event.type == "tool_execution_start":
+            self.state.runningToolCall = replace(event.toolCall) if event.toolCall is not None else None
+        elif event.type == "tool_execution_end":
+            self.state.runningToolCall = None
+            if event.error:
+                self.state.error = event.error
+        elif event.type == "agent_end":
+            self.state.isStreaming = False
+
+        return event
+
+    def _buildLoopConfig(self) -> AgentLoopConfig:
+        """基于当前高层状态构建一次底层循环配置。"""
+
+        async def _steer(state: AgentState):
+            queued_messages = self.dequeueSteeringAll()
+            hook = self._loop.steer
+            if hook is None:
+                return queued_messages
+            result = hook(state)
+            if inspect.isawaitable(result):
+                result = await result
+            hook_messages = [ensure_message(message) for message in (result or [])]
+            return queued_messages + hook_messages
+
+        async def _follow_up(state: AgentState):
+            queued_messages = self.dequeueFollowUpAll()
+            hook = self._loop.followUp
+            if hook is None:
+                return queued_messages
+            result = hook(state)
+            if inspect.isawaitable(result):
+                result = await result
+            hook_messages = [ensure_message(message) for message in (result or [])]
+            return queued_messages + hook_messages
+
+        return AgentLoopConfig(
+            systemPrompt=self.state.systemPrompt,
+            model=self.state.model,
+            thinking=self.state.thinking,
+            tools=[replace(tool) for tool in self.state.tools],
+            stream=self._loop.stream,
+            steer=_steer,
+            followUp=_follow_up,
+            toolExecutionMode=self._loop.toolExecutionMode,
+            beforeToolCall=self._loop.beforeToolCall,
+            afterToolCall=self._loop.afterToolCall,
+            registry=self._loop.registry,
+        )
+
+    async def _runLoopSession(
+        self,
+        *,
+        newMessages: list[ConversationMessage] | None = None,
+        continueOnly: bool = False,
+    ) -> StreamSession[AgentEvent]:
+        """创建高层桥接会话，并在后台同步底层循环事件。"""
+
+        if self._isRunning:
+            raise RuntimeError("Agent is already running")
+
+        if continueOnly and not self.state.history:
+            raise ValueError("Agent.continueConversation requires existing history")
+
+        new_messages = [replace(message) for message in (newMessages or [])]
+        if not self.state.history and not new_messages:
+            raise ValueError("Agent.run requires pending messages when history is empty")
+
+        self._cancelRequested = False
+        self._isRunning = True
+        self.state.error = None
+        if self._loop.thinking is not None:
+            self.state.thinking = self._loop.thinking
+
+        loop_config = self._buildLoopConfig()
+        if continueOnly and not new_messages:
+            lower_session = await agentLoopContinue(self.state, loop=loop_config)
+        elif self.state.history and new_messages:
+            lower_session = _createAgentLoopSession(self.state, loop_config, new_messages=new_messages)
+        else:
+            lower_session = await agentLoop(loop_config, initialMessages=new_messages)
+
+        queue: asyncio.Queue[AgentEvent] = asyncio.Queue(maxsize=64)
+        model = ensure_model(loop_config.model)
+
+        async def _bridge_events() -> None:
+            try:
+                async for event in lower_session.consume():
+                    processed_event = self._handleLoopEvent(event)
+                    await self.emit(processed_event, queue)
+            except asyncio.CancelledError:
+                self._cancelRequested = True
+                await lower_session.close()
+                raise
+            except Exception as exc:
+                self.state.error = str(exc)
+                await self.emit(
+                    AgentEvent(type="agent_end", state=_copy_state(self.state), error=self.state.error),
+                    queue,
+                )
+
+        bridge_task = asyncio.create_task(_bridge_events())
+
+        async def _tracked_bridge() -> None:
+            try:
+                await bridge_task
+            except asyncio.CancelledError:
+                bridge_task.cancel()
+                try:
+                    await bridge_task
+                except asyncio.CancelledError:
+                    pass
+                raise
+            finally:
+                self._isRunning = False
+                self._cancelRequested = False
+                self._currentSession = None
+                self._currentTask = None
+
+        tracked_task = asyncio.create_task(_tracked_bridge())
+        session = StreamSession(
+            model=model,
+            queue=queue,
+            producer_task=tracked_task,
+            should_stop=lambda event: event.type == "agent_end",
+        )
+        self._currentSession = session
+        self._currentTask = tracked_task
+        return session
