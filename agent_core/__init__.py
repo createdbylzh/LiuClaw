@@ -1,14 +1,17 @@
 from .agent import Agent, AgentOptions
 from .agent_loop import agentLoop, agentLoopContinue
 from .types import (
+    AbortSignal,
     AfterToolCallContext,
     AfterToolCallPass,
     AfterToolCallReplace,
     AfterToolCallResult,
     AgentContext,
+    AgentError,
     AgentEvent,
     AgentEventType,
     AgentLoopConfig,
+    AgentRuntimeFlags,
     AgentState,
     AgentStreamFn,
     AgentTool,
@@ -17,10 +20,13 @@ from .types import (
     BeforeToolCallError,
     BeforeToolCallResult,
     BeforeToolCallSkip,
+    RetryContext,
+    RetryDecision,
     ToolExecutionMode,
 )
 
 __all__ = [
+    "AbortSignal",
     "AfterToolCallContext",
     "AfterToolCallPass",
     "AfterToolCallReplace",
@@ -28,9 +34,11 @@ __all__ = [
     "Agent",
     "AgentOptions",
     "AgentContext",
+    "AgentError",
     "AgentEvent",
     "AgentEventType",
     "AgentLoopConfig",
+    "AgentRuntimeFlags",
     "AgentState",
     "AgentStreamFn",
     "AgentTool",
@@ -39,6 +47,8 @@ __all__ = [
     "BeforeToolCallError",
     "BeforeToolCallResult",
     "BeforeToolCallSkip",
+    "RetryContext",
+    "RetryDecision",
     "ToolExecutionMode",
     "agentLoop",
     "agentLoopContinue",
