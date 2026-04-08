@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from ai.types import AssistantMessage, ConversationMessage, Model
+from agent_core import AgentEvent, AgentTool
 
 ReasoningLevel = Literal["low", "medium", "high"]
 SessionEventType = Literal[
@@ -20,6 +21,7 @@ SessionEventType = Literal[
 ]
 SessionPanel = Literal["main", "status", "thinking", "tool", "error"]
 StatusLevel = Literal["info", "success", "warning", "error"]
+ToolMode = Literal["workspace-write", "read-only"]
 
 
 @dataclass(slots=True)
@@ -81,6 +83,71 @@ class ExtensionResource:
 
     name: str
     path: Path
+    module_path: Path | None = None
+    source: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ExtensionCommand:
+    """表示扩展注册的一条命令描述。"""
+
+    name: str
+    handler: Callable[..., Any] | None = None
+    description: str = ""
+    source: str = ""
+
+
+@dataclass(slots=True)
+class ExtensionRuntime:
+    """表示一次扩展装配后得到的运行时贡献结果。"""
+
+    tools: list[AgentTool] = field(default_factory=list)
+    commands: list[ExtensionCommand] = field(default_factory=list)
+    provider_factories: dict[str, Callable[..., Any]] = field(default_factory=dict)
+    event_listeners: list[Callable[[AgentEvent], Any]] = field(default_factory=list)
+    prompt_fragments: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ControlMessage:
+    """表示 steering 或 follow-up 这类显式控制消息。"""
+
+    kind: Literal["steering", "follow_up", "custom"]
+    content: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ToolExecutionContext:
+    """描述一次工具执行前后可见的安全上下文。"""
+
+    tool_name: str
+    workspace_root: Path
+    cwd: Path
+    arguments: dict[str, Any] = field(default_factory=dict)
+    mode: ToolMode = "workspace-write"
+
+
+@dataclass(slots=True)
+class ToolSecurityPolicy:
+    """定义工具执行前后的统一安全策略接口。"""
+
+    before_execute: Callable[[ToolExecutionContext], None] | None = None
+    after_execute: Callable[[ToolExecutionContext, str], str] | None = None
+
+
+@dataclass(slots=True)
+class ToolDefinition:
+    """描述一个可构建的工具定义。"""
+
+    name: str
+    description: str
+    builder: Callable[[Path, CodingAgentSettings], AgentTool]
+    group: str = "general"
+    built_in: bool = False
+    mode: ToolMode = "workspace-write"
+    source: str = "core"
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -93,6 +160,7 @@ class ResourceBundle:
     themes: dict[str, ThemeResource] = field(default_factory=dict)
     agents_context: str | None = None
     extensions: list[ExtensionResource] = field(default_factory=list)
+    extension_runtime: ExtensionRuntime = field(default_factory=ExtensionRuntime)
 
 
 @dataclass(slots=True)
@@ -106,6 +174,7 @@ class SessionContext:
     settings: CodingAgentSettings
     resources: ResourceBundle
     tools_markdown: str
+    extra_prompt_fragments: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

@@ -18,8 +18,8 @@ from coding_agent.core.model_registry import ModelRegistry
 from coding_agent.core.resource_loader import ResourceLoader
 from coding_agent.core.session_manager import SessionManager
 from coding_agent.core.settings_manager import SettingsManager
-from coding_agent.core.tools import build_default_tools
-from coding_agent.core.types import CodingAgentSettings, SessionEvent, ToolPolicy
+from coding_agent.core.tools import build_default_tools, build_tool_registry
+from coding_agent.core.types import CodingAgentSettings, ControlMessage, SessionEvent, ToolPolicy
 from coding_agent.modes.interactive.controller import InteractiveController
 from coding_agent.modes.interactive.renderer import InteractiveRenderer
 from coding_agent.modes.interactive.state import InteractiveState, TranscriptBlock, TranscriptTurn
@@ -267,17 +267,17 @@ async def test_agent_session_uses_steering_and_follow_up(tmp_path: Path, stub_mo
     agent_session.send_user_message("inspect workspace")
     events = [event async for event in agent_session.run_turn()]
     restored = session_manager.build_context_messages(agent_session.session_id)
+    raw_events = session_manager.iter_events(agent_session.session_id)
 
     status_sources = [event.payload.get("source") for event in events if event.type == "status"]
-    restored_control_messages = [
-        message for message in restored if getattr(message, "role", "") == "user" and getattr(message, "metadata", {})
-    ]
+    persisted_control_events = [event for event in raw_events if event["type"] == "control"]
 
     assert "steering" in status_sources
     assert "follow_up" in status_sources
     assert events[-1].message == "final answer"
-    assert any(message.metadata.get("steering") for message in restored_control_messages)
-    assert any(message.metadata.get("follow_up") for message in restored_control_messages)
+    assert all(not getattr(message, "metadata", {}).get("steering") for message in restored if getattr(message, "role", "") == "user")
+    assert any(event["payload"]["metadata"].get("control_kind") == "steering" for event in persisted_control_events)
+    assert any(event["payload"]["metadata"].get("control_kind") == "follow_up" for event in persisted_control_events)
 
 
 @pytest.mark.asyncio
@@ -766,3 +766,64 @@ def test_model_registry_cli_and_main(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     assert exit_code == 0
     assert run_state == {"model": "stub:test", "thinking": "low"}
+
+
+def test_resource_loader_loads_python_extension_runtime_and_tool_registry(tmp_path: Path, stub_model: Model) -> None:
+    root = tmp_path / "root"
+    paths = build_agent_paths(root)
+    paths.ensure_exists()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    extension_dir = paths.extensions_dir / "demo_ext"
+    extension_dir.mkdir(parents=True)
+    (extension_dir / "extension.json").write_text(json.dumps({"module": "extension.py"}), encoding="utf-8")
+    (extension_dir / "extension.py").write_text(
+        "\n".join(
+            [
+                "from agent_core import AgentTool",
+                "",
+                "def register(api):",
+                "    api.extend_system_prompt('EXT PROMPT')",
+                "    api.register_command('demo', description='demo command')",
+                "    api.register_provider('demo_provider', lambda **kwargs: None)",
+                "    async def execute(arguments, context):",
+                "        return 'demo-result'",
+                "    api.register_tool(AgentTool(name='demo_tool', description='demo', inputSchema={}, execute=execute))",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    bundle = ResourceLoader(
+        skills_dir=paths.skills_dir,
+        prompts_dir=paths.prompts_dir,
+        themes_dir=paths.themes_dir,
+        extensions_dir=paths.extensions_dir,
+        workspace_root=workspace,
+    ).load()
+    registry = build_tool_registry(workspace, CodingAgentSettings(default_model=stub_model.id))
+    for tool in bundle.extension_runtime.tools:
+        registry.register_tool(tool, source=tool.metadata.get("source", "extension"))
+
+    assert bundle.extension_runtime.prompt_fragments == ["EXT PROMPT"]
+    assert bundle.extension_runtime.commands[0].name == "demo"
+    assert "demo_provider" in bundle.extension_runtime.provider_factories
+    assert any(tool.name == "demo_tool" for tool in registry.active_tools)
+
+
+def test_session_manager_persists_control_events_separately(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "sessions")
+    snapshot = manager.create_session(cwd=tmp_path, model_id="openai:gpt-5")
+    manager.append_message(snapshot.session_id, message=UserMessage(content="hello"), branch_id=snapshot.branch_id, parent_id=None)
+    manager.append_control(
+        snapshot.session_id,
+        message=ControlMessage(kind="steering", content="control-text", metadata={"phase": "before_tool"}),
+        branch_id=snapshot.branch_id,
+        parent_id=None,
+    )
+
+    messages = manager.build_context_messages(snapshot.session_id)
+    events = manager.iter_events(snapshot.session_id)
+
+    assert all(getattr(message, "role", "") != "control" for message in messages)
+    assert any(event["type"] == "control" for event in events)

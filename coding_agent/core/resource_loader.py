@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from .agents_context_loader import load_agents_context
+from .extensions_runtime import load_extension_runtime, scan_extensions
 from .prompts_loader import load_prompts
 from .skills_loader import load_skills
 from .themes_loader import load_themes
-from .types import ExtensionResource, ResourceBundle
+from .types import ResourceBundle
 
 
 class ResourceLoader:
@@ -38,6 +38,7 @@ class ResourceLoader:
         themes = load_themes(self.themes_dir)
         agents_context = load_agents_context(self.workspace_root)
         extensions = self._scan_extensions()
+        extension_runtime = load_extension_runtime(extensions)
         self._ensure_no_conflicts(skills, prompts, themes, extensions)
         return ResourceBundle(
             skills=skills,
@@ -45,6 +46,7 @@ class ResourceLoader:
             themes=themes,
             agents_context=agents_context,
             extensions=extensions,
+            extension_runtime=extension_runtime,
         )
 
     def _scan_extensions(self) -> list[ExtensionResource]:
@@ -52,19 +54,7 @@ class ResourceLoader:
 
         if not self.extensions_dir.exists():
             return []
-        extensions: list[ExtensionResource] = []
-        for path in sorted(self.extensions_dir.iterdir()):
-            if path.name.startswith("."):
-                continue
-            metadata: dict[str, object] = {}
-            manifest = path / "extension.json" if path.is_dir() else path
-            if manifest.is_file() and manifest.suffix == ".json":
-                try:
-                    metadata = json.loads(manifest.read_text(encoding="utf-8"))
-                except json.JSONDecodeError:
-                    metadata = {}
-            extensions.append(ExtensionResource(name=path.stem, path=path, metadata=metadata))
-        return extensions
+        return scan_extensions(self.extensions_dir)
 
     @staticmethod
     def _ensure_no_conflicts(skills, prompts, themes, extensions) -> None:
