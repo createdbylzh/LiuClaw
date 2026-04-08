@@ -7,7 +7,9 @@ requires-python = ">=3.11"
 dependencies = [
   "openai>=1.109.0",
   "anthropic>=0.54.0",
-  "httpx>=0.27.0",
+  "httpx[socks]>=0.27.0",
+  "lark-oapi>=1.4.18",
+  "python-socks>=2.7.1",
   "prompt_toolkit>=3.0.47",
 ]
 
@@ -22,7 +24,7 @@ requires = ["hatchling>=1.25.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["ai", "agent_core", "coding_agent"]
+packages = ["ai", "agent_core", "coding_agent", "mom"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
