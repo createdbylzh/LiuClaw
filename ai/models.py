@@ -11,6 +11,10 @@ _MODEL_CATALOG: dict[str, Model] = {
         outputPrice=10.0,
         contextWindow=272000,
         maxOutputTokens=128000,
+        supports_reasoning_levels=("off", "minimal", "low", "medium", "high", "xhigh"),
+        supports_images=True,
+        supports_prompt_cache=True,
+        supports_session=True,
     ),
     "openai:gpt-5-mini": Model(
         id="openai:gpt-5-mini",
@@ -19,6 +23,10 @@ _MODEL_CATALOG: dict[str, Model] = {
         outputPrice=2.0,
         contextWindow=272000,
         maxOutputTokens=128000,
+        supports_reasoning_levels=("off", "minimal", "low", "medium", "high"),
+        supports_images=True,
+        supports_prompt_cache=True,
+        supports_session=True,
     ),
     "anthropic:claude-sonnet-4": Model(
         id="anthropic:claude-sonnet-4",
@@ -27,6 +35,9 @@ _MODEL_CATALOG: dict[str, Model] = {
         outputPrice=15.0,
         contextWindow=200000,
         maxOutputTokens=64000,
+        supports_reasoning_levels=("off", "low", "medium", "high", "xhigh"),
+        supports_images=True,
+        supports_prompt_cache=True,
     ),
     "anthropic:claude-haiku-3-5": Model(
         id="anthropic:claude-haiku-3-5",
@@ -35,6 +46,9 @@ _MODEL_CATALOG: dict[str, Model] = {
         outputPrice=4.0,
         contextWindow=200000,
         maxOutputTokens=64000,
+        supports_reasoning_levels=("off", "low", "medium", "high"),
+        supports_images=True,
+        supports_prompt_cache=True,
     ),
     "zhipu:glm-5": Model(
         id="zhipu:glm-5",
@@ -44,6 +58,7 @@ _MODEL_CATALOG: dict[str, Model] = {
         contextWindow=200000,
         maxOutputTokens=128000,
         metadata={"priceStatus": "needs_manual_sync"},
+        supports_reasoning_levels=("off", "low", "medium", "high"),
     ),
     "zhipu:glm-5-turbo": Model(
         id="zhipu:glm-5-turbo",
@@ -53,6 +68,7 @@ _MODEL_CATALOG: dict[str, Model] = {
         contextWindow=200000,
         maxOutputTokens=128000,
         metadata={"priceStatus": "needs_manual_sync"},
+        supports_reasoning_levels=("off", "low", "medium", "high"),
     ),
     "zhipu:glm-4.7": Model(
         id="zhipu:glm-4.7",
@@ -62,6 +78,7 @@ _MODEL_CATALOG: dict[str, Model] = {
         contextWindow=200000,
         maxOutputTokens=128000,
         metadata={"priceStatus": "needs_manual_sync"},
+        supports_reasoning_levels=("off", "low", "medium", "high"),
     ),
     "zhipu:glm-4.6": Model(
         id="zhipu:glm-4.6",
@@ -71,6 +88,7 @@ _MODEL_CATALOG: dict[str, Model] = {
         contextWindow=200000,
         maxOutputTokens=128000,
         metadata={"priceStatus": "needs_manual_sync"},
+        supports_reasoning_levels=("off", "low", "medium", "high"),
     ),
 }
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ai.types import AssistantMessage, ConversationMessage, UserMessage
+from ai.types import AssistantMessage, ConversationMessage, UserMessage, ensure_message
 
 from ..session_manager import SessionManager
 from ..types import CompactResult
@@ -37,7 +37,18 @@ class SessionCompactor:
         lines: list[str] = ["历史摘要："]
         for node in nodes:
             prefix = {"user": "用户", "assistant": "助手", "tool": "工具"}.get(node.role, node.role)
-            content = node.content.strip().replace("\n", " ")
+            message = ensure_message(
+                {
+                    "role": node.role,
+                    "content": node.content,
+                    "toolCallId": node.tool_call_id,
+                    "toolName": node.tool_name,
+                    "thinking": node.thinking,
+                    "toolCalls": node.tool_calls,
+                    "metadata": node.metadata,
+                }
+            )
+            content = message.content.strip().replace("\n", " ")
             if len(content) > 120:
                 content = content[:120] + "..."
             lines.append(f"- {prefix}: {content}")

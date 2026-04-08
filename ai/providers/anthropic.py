@@ -7,7 +7,7 @@ from typing import Any
 from ai.errors import AuthenticationError, ProviderResponseError
 from ai.options import Options
 from ai.providers.base import Provider
-from ai.types import AssistantMessage, StreamEvent, ToolCall
+from ai.types import AssistantMessage, StreamEvent, TextContent, ThinkingContent, ToolCallContent, parse_tool_arguments
 from ai.utils.streaming import EventBuilder, create_done_event
 
 
@@ -100,7 +100,7 @@ class AnthropicProvider(Provider):
                     {
                         "type": "tool_result",
                         "tool_use_id": getattr(message, "toolCallId"),
-                        "content": getattr(message, "content", ""),
+                        "content": getattr(message, "text", getattr(message, "content", "")),
                     }
                 ],
             }
@@ -108,7 +108,7 @@ class AnthropicProvider(Provider):
         tool_calls = getattr(message, "toolCalls", [])
         if tool_calls:
             content: list[dict[str, Any]] = []
-            text = getattr(message, "content", "")
+            text = getattr(message, "text", getattr(message, "content", ""))
             if text:
                 content.append({"type": "text", "text": text})
             for tool_call in tool_calls:
@@ -122,7 +122,7 @@ class AnthropicProvider(Provider):
                 )
             return {"role": "assistant", "content": content}
 
-        return {"role": getattr(message, "role", "user"), "content": getattr(message, "content", "")}
+        return {"role": getattr(message, "role", "user"), "content": getattr(message, "text", getattr(message, "content", ""))}
 
     def _provider_reasoning(self, options: Options) -> dict[str, Any]:
         """读取预先映射好的 provider reasoning 配置。"""
@@ -170,7 +170,7 @@ class AnthropicProvider(Provider):
 
         client = AsyncAnthropic(**self._client_kwargs(options))
         builder = EventBuilder(model=model, provider=self.name)
-        final_message = AssistantMessage(content="", thinking="", toolCalls=[], metadata={})
+        final_message = AssistantMessage(content=[], metadata={})
         tool_buffers: dict[str, str] = {}
         tool_names: dict[str, str] = {}
         tool_index_to_id: dict[str, str] = {}
@@ -207,14 +207,14 @@ class AnthropicProvider(Provider):
                             if not text_started:
                                 text_started = True
                                 yield builder.build("text_start", rawEvent=raw_event)
-                            final_message.content += text
+                            final_message.content.append(TextContent(text=text))
                             yield builder.build("text_delta", text=text, rawEvent=raw_event)
                         elif delta_type == "thinking_delta":
                             thinking = getattr(delta, "thinking", getattr(delta, "text", ""))
                             if not thinking_started:
                                 thinking_started = True
                                 yield builder.build("thinking_start", rawEvent=raw_event)
-                            final_message.thinking += thinking
+                            final_message.content.append(ThinkingContent(thinking=thinking))
                             yield builder.build("thinking_delta", thinking=thinking, rawEvent=raw_event)
                         elif delta_type == "input_json_delta":
                             tool_call_id = tool_index_to_id.get(str(getattr(event, "index", "0")), str(getattr(event, "index", "0")))
@@ -227,7 +227,13 @@ class AnthropicProvider(Provider):
                         tool_call_id = tool_index_to_id.get(block_index)
                         if tool_call_id is not None:
                             arguments = tool_buffers.get(tool_call_id, "")
-                            final_message.toolCalls.append(ToolCall(id=tool_call_id, name=tool_names.get(tool_call_id, ""), arguments=arguments))
+                            final_message.content.append(
+                                ToolCallContent(
+                                    id=tool_call_id,
+                                    name=tool_names.get(tool_call_id, ""),
+                                    arguments=parse_tool_arguments(arguments),
+                                )
+                            )
                             yield builder.build("toolcall_end", toolCallId=tool_call_id, toolName=tool_names.get(tool_call_id), arguments=arguments, rawEvent=raw_event)
                         elif thinking_started:
                             yield builder.build("thinking_end", rawEvent=raw_event)

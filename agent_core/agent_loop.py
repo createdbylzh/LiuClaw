@@ -14,12 +14,16 @@ from ai.types import (
     ConversationMessage,
     Model,
     StreamEvent,
+    TextContent,
+    ThinkingContent,
     Tool,
     ToolCall,
+    ToolCallContent,
     ToolResultMessage,
     UserMessage,
     ensure_message,
     ensure_model,
+    parse_tool_arguments,
 )
 from ai.utils.schema_validation import SchemaValidationError, validate_tool_arguments
 
@@ -139,17 +143,22 @@ def _normalize_tool_result(result: Any, tool_call: ToolCall) -> ToolResultMessag
             toolName=result.toolName or tool_call.name,
             content=result.content,
             metadata=dict(result.metadata),
+            isError=result.isError,
+            details=result.details,
+            timestamp=result.timestamp,
         )
     if isinstance(result, dict):
         metadata = dict(result.get("metadata", {}))
         content = result.get("content")
         if content is None:
-            content = json.dumps(result, ensure_ascii=False)
+            content = json.dumps(result, ensure_ascii=False, sort_keys=True)
         return ToolResultMessage(
             toolCallId=str(result.get("toolCallId", tool_call.id)),
             toolName=str(result.get("toolName", tool_call.name)),
-            content=str(content),
+            content=content,
             metadata=metadata,
+            isError=bool(result.get("isError", metadata.get("error", False))),
+            details=result.get("details"),
         )
     return ToolResultMessage(
         toolCallId=tool_call.id,
@@ -283,22 +292,22 @@ async def streamAssistantResponse(
             if state.currentMessage is None:
                 state.currentMessage = AssistantMessage(content="", thinking="", toolCalls=[])
             if raw_event.itemType == "text" and raw_event.lifecycle == "update":
-                state.currentMessage.content += raw_event.text or ""
+                state.currentMessage.content.append(TextContent(text=raw_event.text or ""))
             elif raw_event.itemType == "thinking" and raw_event.lifecycle == "update":
-                state.currentMessage.thinking += raw_event.thinking or ""
+                state.currentMessage.content.append(ThinkingContent(thinking=raw_event.thinking or ""))
             elif raw_event.itemType == "tool_call" and raw_event.lifecycle == "start" and raw_event.toolCallId:
-                state.currentMessage.toolCalls.append(
-                    ToolCall(id=raw_event.toolCallId, name=raw_event.toolName or "", arguments="")
+                state.currentMessage.content.append(
+                    ToolCallContent(id=raw_event.toolCallId, name=raw_event.toolName or "", arguments="")
                 )
             elif raw_event.itemType == "tool_call" and raw_event.lifecycle == "update" and raw_event.toolCallId:
                 for tool_call in state.currentMessage.toolCalls:
                     if tool_call.id == raw_event.toolCallId:
-                        tool_call.arguments += raw_event.argumentsDelta or ""
+                        tool_call.arguments = f"{tool_call.arguments}{raw_event.argumentsDelta or ''}"
                         break
             elif raw_event.itemType == "tool_call" and raw_event.lifecycle == "done" and raw_event.toolCallId:
                 for tool_call in state.currentMessage.toolCalls:
                     if tool_call.id == raw_event.toolCallId and raw_event.arguments is not None:
-                        tool_call.arguments = raw_event.arguments
+                        tool_call.arguments = parse_tool_arguments(raw_event.arguments)
                         break
 
             if not message_started:
@@ -332,7 +341,7 @@ def _parse_tool_arguments(tool_call: ToolCall) -> Any:
 
     if not tool_call.arguments:
         return {}
-    return json.loads(tool_call.arguments)
+    return parse_tool_arguments(tool_call.arguments)
 
 
 async def prepareToolCall(
@@ -360,7 +369,7 @@ async def prepareToolCall(
         state=state,
         tool=tool,
         toolCall=tool_call,
-        arguments=tool_call.arguments,
+        arguments=tool_call.arguments_text,
         agentContext=_to_agent_context(state),
     )
     before_result = await _maybe_await(loop.beforeToolCall(context)) if loop.beforeToolCall else None
@@ -368,7 +377,7 @@ async def prepareToolCall(
         return PreparedToolCall(
             toolCall=tool_call,
             tool=tool,
-            arguments=tool_call.arguments,
+            arguments=tool_call.arguments_text,
             parsedArguments=parsed_arguments,
             agentContext=context.agentContext,
         )
@@ -413,7 +422,8 @@ async def emitToolCallOutcome(
     tool_message = _normalize_tool_result(result, tool_call)
     if error is not None:
         tool_message.metadata["error"] = True
-        tool_message.content = error
+        tool_message.isError = True
+        tool_message.content = tool_message.content.__class__([TextContent(text=error)])
         state.error = error
 
     await _emit_event(

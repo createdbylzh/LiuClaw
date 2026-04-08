@@ -4,7 +4,18 @@ from dataclasses import dataclass
 from typing import Any
 
 from ai.options import Options
-from ai.types import AssistantMessage, Context, Model, ToolResultMessage, UserMessage
+from ai.types import (
+    AssistantMessage,
+    Context,
+    ImageContent,
+    Model,
+    TextContent,
+    ThinkingContent,
+    ToolCallContent,
+    ToolResultContent,
+    ToolResultMessage,
+    UserMessage,
+)
 
 
 class ContextOverflowError(ValueError):
@@ -84,14 +95,10 @@ def ensure_context_fits_window(model: Model, context: Context, options: Options 
 def _estimate_message_tokens(message: UserMessage | AssistantMessage | ToolResultMessage) -> int:
     """粗略估算一条消息占用的 token 数。"""
 
-    total = _estimate_text_tokens(message.content)
-    if isinstance(message, AssistantMessage):
-        total += _estimate_text_tokens(message.thinking)
-        for tool_call in message.toolCalls:
-            total += _estimate_text_tokens(tool_call.id)
-            total += _estimate_text_tokens(tool_call.name)
-            total += _estimate_text_tokens(tool_call.arguments)
-    elif isinstance(message, ToolResultMessage):
+    total = 0
+    for block in message.content:
+        total += _estimate_content_block_tokens(block)
+    if isinstance(message, ToolResultMessage):
         total += _estimate_text_tokens(message.toolCallId)
         total += _estimate_text_tokens(message.toolName)
     return total
@@ -104,6 +111,26 @@ def _estimate_text_tokens(text: str) -> int:
     if not text:
         return 0
     return max(1, (len(text) + 2) // 3)
+
+
+def _estimate_content_block_tokens(block: object) -> int:
+    """估算单个内容块占用的 token 数。"""
+
+    if isinstance(block, TextContent):
+        return _estimate_text_tokens(block.text)
+    if isinstance(block, ThinkingContent):
+        return _estimate_text_tokens(block.thinking)
+    if isinstance(block, ToolCallContent):
+        return (
+            _estimate_text_tokens(block.id)
+            + _estimate_text_tokens(block.name)
+            + _estimate_text_tokens(block.arguments_text)
+        )
+    if isinstance(block, ToolResultContent):
+        return _estimate_text_tokens(block.text) + _estimate_text_tokens(str(block.metadata))
+    if isinstance(block, ImageContent):
+        return _estimate_text_tokens(block.mimeType) + _estimate_text_tokens(str(block.metadata))
+    return _estimate_text_tokens(str(block))
 
 
 

@@ -1,4 +1,4 @@
-from ai import AssistantMessage, Model, StreamEvent, ToolCall
+from ai import AssistantMessage, Model, StreamEvent, TextContent, ThinkingContent, ToolCall, ToolCallContent
 
 
 def test_stream_event_done_can_hold_final_result() -> None:
@@ -37,8 +37,13 @@ def test_assistant_message_supports_text_thinking_and_toolcalls() -> None:
     )
 
     assert message.content == "hello"
+    assert isinstance(message.content, list)
+    assert isinstance(message.content[0], TextContent)
+    assert isinstance(message.content[1], ThinkingContent)
+    assert isinstance(message.content[2], ToolCallContent)
     assert message.thinking == "reasoning"
     assert message.toolCalls[0].name == "lookup"
+    assert message.toolCalls[0].arguments == {}
 
 
 def test_stream_event_legacy_aliases_map_to_canonical_lifecycle() -> None:

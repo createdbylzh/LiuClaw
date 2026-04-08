@@ -2,7 +2,19 @@ from __future__ import annotations
 
 import unicodedata
 
-from ai.types import AssistantMessage, Context, Tool, ToolCall, ToolResultMessage, UserMessage
+from ai.types import (
+    AssistantMessage,
+    Context,
+    ImageContent,
+    TextContent,
+    ThinkingContent,
+    Tool,
+    ToolCall,
+    ToolCallContent,
+    ToolResultContent,
+    ToolResultMessage,
+    UserMessage,
+)
 
 _DISALLOWED_CATEGORIES = {"Cc", "Cf"}
 _ALLOWED_CONTROL_CHARACTERS = {"\n", "\r", "\t"}
@@ -34,19 +46,29 @@ def sanitize_unicode_context(context: Context) -> Context:
 def _sanitize_message(message: UserMessage | AssistantMessage | ToolResultMessage):
     """清理统一消息对象中的文本字段。"""
     if isinstance(message, UserMessage):
-        return UserMessage(content=sanitize_unicode(message.content), metadata=dict(message.metadata))
+        return UserMessage(
+            content=[_sanitize_content_block(block) for block in message.content],
+            metadata=dict(message.metadata),
+            timestamp=message.timestamp,
+        )
     if isinstance(message, AssistantMessage):
         return AssistantMessage(
-            content=sanitize_unicode(message.content),
-            thinking=sanitize_unicode(message.thinking),
-            toolCalls=[_sanitize_tool_call(tool_call) for tool_call in message.toolCalls],
+            content=[_sanitize_content_block(block) for block in message.content],
             metadata=dict(message.metadata),
+            usage=dict(message.usage) if message.usage is not None else None,
+            stopReason=message.stopReason,
+            responseId=message.responseId,
+            errorMessage=message.errorMessage,
+            timestamp=message.timestamp,
         )
     return ToolResultMessage(
         toolCallId=sanitize_unicode(message.toolCallId),
         toolName=sanitize_unicode(message.toolName),
-        content=sanitize_unicode(message.content),
+        content=[_sanitize_content_block(block) for block in message.content],
         metadata=dict(message.metadata),
+        isError=message.isError,
+        details=message.details,
+        timestamp=message.timestamp,
     )
 
 
@@ -68,3 +90,34 @@ def _sanitize_tool_call(tool_call: ToolCall) -> ToolCall:
         arguments=sanitize_unicode(tool_call.arguments),
         metadata=dict(tool_call.metadata),
     )
+
+
+def _sanitize_content_block(block):
+    """清理内容块中的文本字段。"""
+
+    if isinstance(block, TextContent):
+        return TextContent(text=sanitize_unicode(block.text))
+    if isinstance(block, ThinkingContent):
+        return ThinkingContent(thinking=sanitize_unicode(block.thinking))
+    if isinstance(block, ToolCallContent):
+        return ToolCallContent(
+            id=sanitize_unicode(block.id),
+            name=sanitize_unicode(block.name),
+            arguments=sanitize_unicode(block.arguments_text),
+            metadata=dict(block.metadata),
+        )
+    if isinstance(block, ToolResultContent):
+        return ToolResultContent(
+            text=sanitize_unicode(block.text),
+            data=block.data,
+            mimeType=block.mimeType,
+            metadata=dict(block.metadata),
+        )
+    if isinstance(block, ImageContent):
+        return ImageContent(
+            data=block.data,
+            mimeType=block.mimeType,
+            detail=block.detail,
+            metadata=dict(block.metadata),
+        )
+    return block

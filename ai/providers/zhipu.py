@@ -8,7 +8,7 @@ from typing import Any
 from ai.errors import AuthenticationError, ProviderResponseError
 from ai.options import Options
 from ai.providers.base import Provider
-from ai.types import AssistantMessage, StreamEvent, ToolCall
+from ai.types import AssistantMessage, StreamEvent, TextContent, ThinkingContent, ToolCallContent, parse_tool_arguments
 from ai.utils.streaming import EventBuilder, create_done_event
 
 
@@ -107,12 +107,12 @@ class ZhipuProvider(Provider):
             return {
                 "role": "tool",
                 "tool_call_id": getattr(message, "toolCallId"),
-                "content": getattr(message, "content", ""),
+                "content": getattr(message, "text", getattr(message, "content", "")),
             }
 
         payload: dict[str, Any] = {
             "role": getattr(message, "role", "user"),
-            "content": getattr(message, "content", ""),
+            "content": getattr(message, "text", getattr(message, "content", "")),
         }
 
         thinking = getattr(message, "thinking", "")
@@ -251,7 +251,7 @@ class ZhipuProvider(Provider):
 
         request = self._build_request(model, context, options)
         builder = EventBuilder(model=model, provider=self.name)
-        final_message = AssistantMessage(content="", thinking="", toolCalls=[], metadata={})
+        final_message = AssistantMessage(content=[], metadata={})
         tool_buffers: dict[str, str] = {}
         tool_names: dict[str, str] = {}
         tool_finished: set[str] = set()
@@ -283,7 +283,7 @@ class ZhipuProvider(Provider):
                     if not thinking_started:
                         emitted_events.append(builder.build("thinking_start", rawEvent=raw_event))
                         thinking_started = True
-                    final_message.thinking += thinking_delta
+                    final_message.content.append(ThinkingContent(thinking=thinking_delta))
                     emitted_events.append(builder.build("thinking_delta", thinking=thinking_delta, rawEvent=raw_event))
 
                 text_delta = delta.get("content")
@@ -293,7 +293,7 @@ class ZhipuProvider(Provider):
                     if not text_started:
                         emitted_events.append(builder.build("text_start", rawEvent=raw_event))
                         text_started = True
-                    final_message.content += text_delta
+                    final_message.content.append(TextContent(text=text_delta))
                     emitted_events.append(builder.build("text_delta", text=text_delta, rawEvent=raw_event))
 
                 for tool_delta in delta.get("tool_calls") or []:
@@ -334,8 +334,12 @@ class ZhipuProvider(Provider):
                         if key in tool_finished:
                             continue
                         tool_finished.add(key)
-                        final_message.toolCalls.append(
-                            ToolCall(id=key, name=tool_names.get(key, ""), arguments=arguments)
+                        final_message.content.append(
+                            ToolCallContent(
+                                id=key,
+                                name=tool_names.get(key, ""),
+                                arguments=parse_tool_arguments(arguments),
+                            )
                         )
                         emitted_events.append(
                             builder.build(
@@ -357,7 +361,13 @@ class ZhipuProvider(Provider):
             for key, arguments in list(tool_buffers.items()):
                 if key in tool_finished:
                     continue
-                final_message.toolCalls.append(ToolCall(id=key, name=tool_names.get(key, ""), arguments=arguments))
+                final_message.content.append(
+                    ToolCallContent(
+                        id=key,
+                        name=tool_names.get(key, ""),
+                        arguments=parse_tool_arguments(arguments),
+                    )
+                )
                 yield builder.build("toolcall_end", toolCallId=key, toolName=tool_names.get(key), arguments=arguments)
             yield create_done_event(
                 final_message,

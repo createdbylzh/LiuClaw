@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 from ..types import AssistantMessage, Context, ToolCall, ToolResultMessage, UserMessage, ensure_context
@@ -34,15 +35,18 @@ def _convert_message(provider: str | None, message: Any) -> Any:
     """把单条统一消息转换为目标 provider 兼容的表示。"""
 
     if isinstance(message, UserMessage):
-        return UserMessage(content=message.content, metadata=dict(message.metadata))
+        return UserMessage(content=deepcopy(message.content), metadata=dict(message.metadata), timestamp=message.timestamp)
     if isinstance(message, ToolResultMessage):
         metadata = dict(message.metadata)
         metadata["targetProvider"] = provider
         return ToolResultMessage(
             toolCallId=message.toolCallId,
             toolName=message.toolName,
-            content=message.content,
+            content=deepcopy(message.content),
             metadata=metadata,
+            isError=message.isError,
+            details=deepcopy(message.details),
+            timestamp=message.timestamp,
         )
     if isinstance(message, AssistantMessage):
         return _convert_assistant_message(provider, message)
@@ -59,10 +63,13 @@ def _convert_assistant_message(provider: str | None, message: AssistantMessage) 
         metadata.setdefault("historicalThinking", message.thinking)
 
     return AssistantMessage(
-        content=message.content,
-        thinking=message.thinking,
-        toolCalls=[_convert_tool_call(provider, tool_call) for tool_call in message.toolCalls],
+        content=deepcopy(message.content),
         metadata=metadata,
+        usage=deepcopy(message.usage),
+        stopReason=message.stopReason,
+        responseId=message.responseId,
+        errorMessage=message.errorMessage,
+        timestamp=message.timestamp,
     )
 
 

@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from dataclasses import replace
 from typing import Any
 
-from ai.types import AssistantMessage, Model, StreamEvent, ToolCall
+from ai.types import AssistantMessage, Model, StreamEvent, TextContent, ThinkingContent, ToolCallContent, parse_tool_arguments
 
 DEFAULT_STREAM_QUEUE_MAXSIZE = 128
 
@@ -158,18 +158,18 @@ class StreamAccumulator:
         """消费一个统一事件，并在 `done` 时返回最终消息。"""
 
         if event.itemType == "text" and event.lifecycle == "update" and event.text:
-            self._assistant_message.content += event.text
+            self._assistant_message.content.append(TextContent(text=event.text))
         elif event.itemType == "thinking" and event.lifecycle == "update" and event.thinking:
-            self._assistant_message.thinking += event.thinking
+            self._assistant_message.content.append(ThinkingContent(thinking=event.thinking))
         elif event.itemType == "tool_call" and event.lifecycle == "start" and event.toolCallId:
             self._ensure_tool_call(event.toolCallId, event.toolName)
         elif event.itemType == "tool_call" and event.lifecycle == "update" and event.toolCallId:
             tool_call = self._ensure_tool_call(event.toolCallId, event.toolName)
-            tool_call.arguments += event.argumentsDelta or ""
+            tool_call.arguments = f"{tool_call.arguments}{event.argumentsDelta or ''}"
         elif event.itemType == "tool_call" and event.lifecycle == "done" and event.toolCallId:
             tool_call = self._ensure_tool_call(event.toolCallId, event.toolName)
             if event.arguments is not None:
-                tool_call.arguments = event.arguments
+                tool_call.arguments = parse_tool_arguments(event.arguments)
         elif event.type == "done" and event.lifecycle == "done":
             self._done_event = event
             self._usage = event.usage
@@ -181,18 +181,18 @@ class StreamAccumulator:
             self._error_event = event
         return None
 
-    def _ensure_tool_call(self, tool_call_id: str, tool_name: str | None) -> ToolCall:
+    def _ensure_tool_call(self, tool_call_id: str, tool_name: str | None) -> ToolCallContent:
         """确保指定 id 的工具调用在聚合状态中存在。"""
 
         if tool_call_id in self._tool_call_index:
-            tool_call = self._assistant_message.toolCalls[self._tool_call_index[tool_call_id]]
+            tool_call = self._assistant_message.content[self._tool_call_index[tool_call_id]]
             if tool_name and not tool_call.name:
                 tool_call.name = tool_name
             return tool_call
 
-        tool_call = ToolCall(id=tool_call_id, name=tool_name or "", arguments="")
-        self._assistant_message.toolCalls.append(tool_call)
-        self._tool_call_index[tool_call_id] = len(self._assistant_message.toolCalls) - 1
+        tool_call = ToolCallContent(id=tool_call_id, name=tool_name or "", arguments="")
+        self._assistant_message.content.append(tool_call)
+        self._tool_call_index[tool_call_id] = len(self._assistant_message.content) - 1
         return tool_call
 
 

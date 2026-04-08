@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypeAlias
+from typing import Any, Iterable, Literal, TypeAlias
 
 ReasoningLevel = Literal["off", "minimal", "low", "medium", "high", "xhigh"]
 StreamEventType = Literal[
@@ -22,7 +22,7 @@ StreamEventType = Literal[
     "toolcall_end",
     "tool_result",
 ]
-ContentBlockType = Literal["text", "thinking", "image", "tool_call", "tool_result_content"]
+ContentBlockType = Literal["text", "thinking", "tool_call", "image", "tool_result_content"]
 StreamLifecycle = Literal["start", "update", "done", "error"]
 StreamItemType = Literal["message", "text", "thinking", "tool_call", "tool_result", "image"]
 
@@ -38,6 +38,7 @@ _LEGACY_STREAM_EVENT_ALIASES: dict[str, tuple[StreamLifecycle, StreamItemType]] 
     "toolcall_end": ("done", "tool_call"),
     "tool_result": ("update", "tool_result"),
 }
+_REASONING_ORDER: tuple[ReasoningLevel, ...] = ("off", "minimal", "low", "medium", "high", "xhigh")
 
 
 @dataclass(slots=True)
@@ -63,6 +64,8 @@ class ImageContent:
     type: Literal["image"] = "image"
     data: str = ""
     mimeType: str = "image/png"
+    detail: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -76,9 +79,6 @@ class ToolResultContent:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-MessageContentBlock: TypeAlias = TextContent | ThinkingContent | ImageContent | ToolResultContent
-
-
 @dataclass(slots=True)
 class Tool:
     """定义可供模型调用的工具。"""
@@ -90,14 +90,42 @@ class Tool:
     renderMetadata: dict[str, Any] = field(default_factory=dict)
 
 
+def serialize_tool_arguments(arguments: Any) -> str:
+    """把工具参数稳定序列化为字符串。"""
+
+    if isinstance(arguments, str):
+        return arguments
+    if arguments in (None, ""):
+        return ""
+    return json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def parse_tool_arguments(arguments: Any) -> Any:
+    """尽可能把工具参数解析为结构化对象。"""
+
+    if isinstance(arguments, (dict, list)):
+        return arguments
+    if arguments in (None, ""):
+        return {}
+    if not isinstance(arguments, str):
+        return arguments
+    try:
+        return json.loads(arguments)
+    except json.JSONDecodeError:
+        return arguments
+
+
 @dataclass(slots=True)
 class ToolCall:
     """表示 assistant 发起的一次工具调用。"""
 
     id: str
     name: str
-    arguments: Any = ""
+    arguments: Any = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.arguments = parse_tool_arguments(self.arguments)
 
     @property
     def arguments_text(self) -> str:
@@ -116,6 +144,9 @@ class ToolCallContent:
     arguments: Any = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.arguments = parse_tool_arguments(self.arguments)
+
     @property
     def arguments_text(self) -> str:
         """返回兼容旧实现的字符串参数。"""
@@ -123,9 +154,121 @@ class ToolCallContent:
         return serialize_tool_arguments(self.arguments)
 
 
-AssistantContentBlock: TypeAlias = TextContent | ThinkingContent | ImageContent | ToolCallContent
+MessageContentBlock: TypeAlias = TextContent | ThinkingContent | ToolCallContent | ImageContent | ToolResultContent
+AssistantContentBlock: TypeAlias = TextContent | ThinkingContent | ToolCallContent | ImageContent
 UserContentBlock: TypeAlias = TextContent | ImageContent
 ToolResultContentBlock: TypeAlias = TextContent | ImageContent | ToolResultContent
+
+
+class ContentBlocks(list[MessageContentBlock]):
+    """统一内容块列表，兼容列表访问与文本视图读取。"""
+
+    @property
+    def text(self) -> str:
+        """返回内容块中的纯文本拼接结果。"""
+
+        return extract_text_from_blocks(self)
+
+    @property
+    def thinking(self) -> str:
+        """返回内容块中的 thinking 拼接结果。"""
+
+        return extract_thinking_from_blocks(self)
+
+    @property
+    def tool_calls(self) -> list[ToolCall]:
+        """返回内容块中的工具调用。"""
+
+        return extract_tool_calls_from_blocks(self)
+
+    def append_text(self, text: str) -> None:
+        """追加一个文本块。"""
+
+        if text:
+            self.append(TextContent(text=text))
+
+    def append_thinking(self, thinking: str) -> None:
+        """追加一个思考块。"""
+
+        if thinking:
+            self.append(ThinkingContent(thinking=thinking))
+
+    def append_tool_call(self, tool_call: ToolCall | ToolCallContent | dict[str, Any]) -> None:
+        """追加一个工具调用块。"""
+
+        if isinstance(tool_call, ToolCallContent):
+            self.append(tool_call)
+            return
+        normalized = ensure_tool_call(tool_call)
+        self.append(
+            ToolCallContent(
+                id=normalized.id,
+                name=normalized.name,
+                arguments=normalized.arguments,
+                metadata=dict(normalized.metadata),
+            )
+        )
+
+    def __str__(self) -> str:
+        return self.text
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self.text == other
+        return super().__eq__(other)
+
+    def __iadd__(self, other: object):
+        if isinstance(other, str):
+            self.append_text(other)
+            return self
+        if isinstance(other, Iterable):
+            for item in other:
+                self.append(item)
+            return self
+        return NotImplemented
+
+    def strip(self, chars: str | None = None) -> str:
+        """兼容旧式字符串读取。"""
+
+        return self.text.strip(chars)
+
+    def replace(self, old: str, new: str, count: int = -1) -> str:
+        """兼容旧式字符串读取。"""
+
+        return self.text.replace(old, new, count)
+
+    def splitlines(self, keepends: bool = False) -> list[str]:
+        """兼容旧式字符串读取。"""
+
+        return self.text.splitlines(keepends)
+
+    def rstrip(self, chars: str | None = None) -> str:
+        """兼容旧式字符串读取。"""
+
+        return self.text.rstrip(chars)
+
+    def lstrip(self, chars: str | None = None) -> str:
+        """兼容旧式字符串读取。"""
+
+        return self.text.lstrip(chars)
+
+    def startswith(self, prefix: str | tuple[str, ...], start: int = 0, end: int | None = None) -> bool:
+        """兼容旧式字符串读取。"""
+
+        text = self.text if end is None else self.text[:end]
+        return text.startswith(prefix, start)
+
+    def endswith(self, suffix: str | tuple[str, ...], start: int = 0, end: int | None = None) -> bool:
+        """兼容旧式字符串读取。"""
+
+        text = self.text[slice(start, end)]
+        return text.endswith(suffix)
+
+
+def _now_ms() -> int:
+    """返回当前时间戳毫秒值。"""
+
+    return int(time.time() * 1000)
 
 
 @dataclass(slots=True)
@@ -133,55 +276,85 @@ class UserMessage:
     """表示用户输入消息。"""
 
     role: Literal["user"] = "user"
-    content: Any = ""
+    content: ContentBlocks = field(default_factory=ContentBlocks)
     metadata: dict[str, Any] = field(default_factory=dict)
-    contentBlocks: list[UserContentBlock] = field(default_factory=list)
-    timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
+    timestamp: int = field(default_factory=_now_ms)
 
     def __post_init__(self) -> None:
-        if self.contentBlocks:
-            self.content = extract_text_from_blocks(self.contentBlocks)
-        else:
-            self.contentBlocks = normalize_user_content_blocks(self.content)
-            self.content = extract_text_from_blocks(self.contentBlocks)
+        self.content = ContentBlocks(normalize_user_content_blocks(self.content))
+
+    @property
+    def text(self) -> str:
+        """返回消息中的纯文本。"""
+
+        return self.content.text
 
 
-@dataclass(slots=True)
+@dataclass(init=False, slots=True)
 class AssistantMessage:
     """表示 assistant 消息，也是 `complete()` 的最终结果对象。"""
 
     role: Literal["assistant"] = "assistant"
-    content: Any = ""
-    thinking: str = ""
-    toolCalls: list[ToolCall] = field(default_factory=list)
+    content: ContentBlocks = field(default_factory=ContentBlocks)
     metadata: dict[str, Any] = field(default_factory=dict)
-    contentBlocks: list[AssistantContentBlock] = field(default_factory=list)
     usage: dict[str, Any] | None = None
     stopReason: str | None = None
     responseId: str | None = None
     errorMessage: str | None = None
-    timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
+    timestamp: int = field(default_factory=_now_ms)
 
-    def __post_init__(self) -> None:
-        self.toolCalls = [ensure_tool_call(item) for item in self.toolCalls]
-        if self.contentBlocks:
-            self.content = extract_text_from_blocks(self.contentBlocks)
-            self.thinking = extract_thinking_from_blocks(self.contentBlocks) or self.thinking
-            self.toolCalls = extract_tool_calls_from_blocks(self.contentBlocks) or self.toolCalls
-        else:
-            self.contentBlocks = normalize_assistant_content_blocks(
-                self.content,
-                thinking=self.thinking,
-                tool_calls=self.toolCalls,
+    def __init__(
+        self,
+        *,
+        role: Literal["assistant"] = "assistant",
+        content: Any = None,
+        thinking: str | None = None,
+        toolCalls: list[ToolCall | dict[str, Any]] | None = None,
+        metadata: dict[str, Any] | None = None,
+        usage: dict[str, Any] | None = None,
+        stopReason: str | None = None,
+        responseId: str | None = None,
+        errorMessage: str | None = None,
+        timestamp: int | None = None,
+    ) -> None:
+        self.role = role
+        self.content = ContentBlocks(
+            normalize_assistant_content_blocks(
+                content,
+                thinking=thinking or "",
+                tool_calls=toolCalls or [],
             )
-            self.content = extract_text_from_blocks(self.contentBlocks)
-            self.thinking = extract_thinking_from_blocks(self.contentBlocks)
+        )
+        self.metadata = dict(metadata or {})
+        self.usage = usage
+        self.stopReason = stopReason
+        self.responseId = responseId
+        self.errorMessage = errorMessage
+        self.timestamp = _now_ms() if timestamp is None else timestamp
 
     @property
     def text(self) -> str:
         """返回 assistant 的最终文本内容。"""
 
-        return self.content
+        return self.content.text
+
+    @property
+    def thinking_text(self) -> str:
+        """返回 assistant 的思考文本。"""
+
+        return self.content.thinking
+
+    @property
+    def thinking(self) -> str:
+        """兼容旧实现读取 thinking。"""
+
+        return self.content.thinking
+
+    @property
+    def toolCalls(self) -> list[ToolCall]:
+        """兼容旧实现读取工具调用列表。"""
+
+        return self.content.tool_calls
 
 
 @dataclass(slots=True)
@@ -191,19 +364,20 @@ class ToolResultMessage:
     role: Literal["tool"] = "tool"
     toolCallId: str = ""
     toolName: str = ""
-    content: Any = ""
+    content: ContentBlocks = field(default_factory=ContentBlocks)
     metadata: dict[str, Any] = field(default_factory=dict)
-    contentBlocks: list[ToolResultContentBlock] = field(default_factory=list)
     isError: bool = False
     details: Any | None = None
-    timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
+    timestamp: int = field(default_factory=_now_ms)
 
     def __post_init__(self) -> None:
-        if self.contentBlocks:
-            self.content = extract_text_from_blocks(self.contentBlocks)
-        else:
-            self.contentBlocks = normalize_tool_result_content_blocks(self.content)
-            self.content = extract_text_from_blocks(self.contentBlocks)
+        self.content = ContentBlocks(normalize_tool_result_content_blocks(self.content))
+
+    @property
+    def text(self) -> str:
+        """返回工具结果中的纯文本。"""
+
+        return self.content.text
 
 
 ConversationMessage: TypeAlias = UserMessage | AssistantMessage | ToolResultMessage
@@ -235,7 +409,14 @@ class Model:
             return reasoning
         if not self.supports_reasoning_levels:
             return None
-        return self.supports_reasoning_levels[-1]
+
+        requested_index = _REASONING_ORDER.index(reasoning)
+        supported_indexes = [_REASONING_ORDER.index(level) for level in self.supports_reasoning_levels]
+        lower_or_equal = [index for index in supported_indexes if index <= requested_index]
+        if lower_or_equal:
+            clamped_index = max(lower_or_equal)
+            return _REASONING_ORDER[clamped_index]
+        return self.supports_reasoning_levels[0]
 
 
 @dataclass(slots=True)
@@ -244,7 +425,7 @@ class Context:
 
     systemPrompt: str | None = None
     messages: list[ConversationMessage | dict[str, Any]] = field(default_factory=list)
-    tools: list[Tool] = field(default_factory=list)
+    tools: list[Tool | dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.messages = [ensure_message(item) for item in self.messages]
@@ -278,7 +459,7 @@ class StreamEvent:
     metadata: dict[str, Any] = field(default_factory=dict)
     providerMetadata: dict[str, Any] = field(default_factory=dict)
     rawEvent: Any | None = None
-    timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
+    timestamp: int = field(default_factory=_now_ms)
 
     def __post_init__(self) -> None:
         alias = _LEGACY_STREAM_EVENT_ALIASES.get(self.type)
@@ -317,98 +498,45 @@ class StreamEvent:
         return self.lifecycle in {"done", "error"} and self.itemType == "message"
 
 
-def serialize_tool_arguments(arguments: Any) -> str:
-    """把工具参数稳定序列化为字符串。"""
-
-    if isinstance(arguments, str):
-        return arguments
-    if arguments in (None, ""):
-        return ""
-    return json.dumps(arguments, ensure_ascii=False, sort_keys=True)
-
-
-def parse_tool_arguments(arguments: Any) -> Any:
-    """尽可能把工具参数解析为结构化对象。"""
-
-    if isinstance(arguments, (dict, list)):
-        return arguments
-    if arguments in (None, ""):
-        return {}
-    if not isinstance(arguments, str):
-        return arguments
-    try:
-        return json.loads(arguments)
-    except json.JSONDecodeError:
-        return arguments
-
-
 def normalize_user_content_blocks(value: Any) -> list[UserContentBlock]:
     """归一化用户消息内容块。"""
 
-    blocks: list[UserContentBlock] = []
+    if isinstance(value, ContentBlocks):
+        return [ensure_user_content_block(item) for item in value]
     if isinstance(value, list):
-        for item in value:
-            if isinstance(item, (TextContent, ImageContent)):
-                blocks.append(item)
-            elif isinstance(item, dict) and item.get("type") == "image":
-                blocks.append(ImageContent(data=str(item.get("data", "")), mimeType=str(item.get("mimeType", "image/png"))))
-            elif isinstance(item, dict):
-                blocks.append(TextContent(text=str(item.get("text", item.get("content", "")))))
-            else:
-                blocks.append(TextContent(text=str(item)))
-        return blocks
-    if value not in (None, ""):
-        blocks.append(TextContent(text=str(value)))
-    return blocks
+        return [ensure_user_content_block(item) for item in value]
+    if value in (None, ""):
+        return []
+    return [TextContent(text=str(value))]
 
 
 def normalize_assistant_content_blocks(
     value: Any,
     *,
     thinking: str = "",
-    tool_calls: list[ToolCall] | None = None,
+    tool_calls: list[ToolCall | dict[str, Any]] | None = None,
 ) -> list[AssistantContentBlock]:
     """归一化 assistant 内容块。"""
 
-    blocks: list[AssistantContentBlock] = []
-    if isinstance(value, list):
-        for item in value:
-            if isinstance(item, (TextContent, ThinkingContent, ImageContent, ToolCallContent)):
-                blocks.append(item)
-            elif isinstance(item, ToolCall):
-                blocks.append(ToolCallContent(id=item.id, name=item.name, arguments=item.arguments, metadata=dict(item.metadata)))
-            elif isinstance(item, dict):
-                block_type = item.get("type")
-                if block_type == "thinking":
-                    blocks.append(ThinkingContent(thinking=str(item.get("thinking", ""))))
-                elif block_type == "image":
-                    blocks.append(ImageContent(data=str(item.get("data", "")), mimeType=str(item.get("mimeType", "image/png"))))
-                elif block_type in {"tool_call", "toolCall"}:
-                    blocks.append(
-                        ToolCallContent(
-                            id=str(item.get("id", "")),
-                            name=str(item.get("name", "")),
-                            arguments=parse_tool_arguments(item.get("arguments", {})),
-                            metadata=dict(item.get("metadata", {})),
-                        )
-                    )
-                else:
-                    blocks.append(TextContent(text=str(item.get("text", item.get("content", "")))))
-            else:
-                blocks.append(TextContent(text=str(item)))
-    elif value not in (None, ""):
-        blocks.append(TextContent(text=str(value)))
+    if isinstance(value, ContentBlocks):
+        blocks = [ensure_assistant_content_block(item) for item in value]
+    elif isinstance(value, list):
+        blocks = [ensure_assistant_content_block(item) for item in value]
+    elif value in (None, ""):
+        blocks = []
+    else:
+        blocks = [TextContent(text=str(value))]
 
     if thinking:
         blocks.append(ThinkingContent(thinking=thinking))
-    for tool_call in tool_calls or []:
-        normalized_tool_call = ensure_tool_call(tool_call)
+    for item in tool_calls or []:
+        tool_call = ensure_tool_call(item)
         blocks.append(
             ToolCallContent(
-                id=normalized_tool_call.id,
-                name=normalized_tool_call.name,
-                arguments=normalized_tool_call.arguments,
-                metadata=dict(normalized_tool_call.metadata),
+                id=tool_call.id,
+                name=tool_call.name,
+                arguments=tool_call.arguments,
+                metadata=dict(tool_call.metadata),
             )
         )
     return blocks
@@ -417,34 +545,17 @@ def normalize_assistant_content_blocks(
 def normalize_tool_result_content_blocks(value: Any) -> list[ToolResultContentBlock]:
     """归一化工具结果内容块。"""
 
-    blocks: list[ToolResultContentBlock] = []
+    if isinstance(value, ContentBlocks):
+        return [ensure_tool_result_content_block(item) for item in value]
     if isinstance(value, list):
-        for item in value:
-            if isinstance(item, (TextContent, ImageContent, ToolResultContent)):
-                blocks.append(item)
-            elif isinstance(item, dict) and item.get("type") == "image":
-                blocks.append(ImageContent(data=str(item.get("data", "")), mimeType=str(item.get("mimeType", "image/png"))))
-            elif isinstance(item, dict) and item.get("type") == "tool_result_content":
-                blocks.append(
-                    ToolResultContent(
-                        text=str(item.get("text", "")),
-                        data=item.get("data"),
-                        mimeType=item.get("mimeType"),
-                        metadata=dict(item.get("metadata", {})),
-                    )
-                )
-            elif isinstance(item, dict):
-                blocks.append(TextContent(text=str(item.get("text", item.get("content", "")))))
-            else:
-                blocks.append(TextContent(text=str(item)))
-        return blocks
-    if value not in (None, ""):
-        blocks.append(TextContent(text=str(value)))
-    return blocks
+        return [ensure_tool_result_content_block(item) for item in value]
+    if value in (None, ""):
+        return []
+    return [TextContent(text=str(value))]
 
 
-def extract_text_from_blocks(blocks: list[Any]) -> str:
-    """从内容块中提取文本。"""
+def extract_text_from_blocks(blocks: Iterable[Any]) -> str:
+    """从内容块中提取纯文本。"""
 
     parts: list[str] = []
     for block in blocks:
@@ -455,42 +566,31 @@ def extract_text_from_blocks(blocks: list[Any]) -> str:
     return "".join(parts)
 
 
-def extract_thinking_from_blocks(blocks: list[Any]) -> str:
+def extract_thinking_from_blocks(blocks: Iterable[Any]) -> str:
     """从内容块中提取思考文本。"""
 
     return "".join(block.thinking for block in blocks if isinstance(block, ThinkingContent))
 
 
-def extract_tool_calls_from_blocks(blocks: list[Any]) -> list[ToolCall]:
+def extract_tool_calls_from_blocks(blocks: Iterable[Any]) -> list[ToolCall]:
     """从内容块中提取工具调用。"""
 
     tool_calls: list[ToolCall] = []
     for block in blocks:
         if isinstance(block, ToolCallContent):
-            tool_calls.append(ToolCall(id=block.id, name=block.name, arguments=block.arguments, metadata=dict(block.metadata)))
+            tool_calls.append(
+                ToolCall(
+                    id=block.id,
+                    name=block.name,
+                    arguments=block.arguments,
+                    metadata=dict(block.metadata),
+                )
+            )
     return tool_calls
 
 
-def rebuild_assistant_content_blocks(message: AssistantMessage) -> list[AssistantContentBlock]:
-    """从旧字段重建 assistant 内容块。"""
-
-    return normalize_assistant_content_blocks(message.content, thinking=message.thinking, tool_calls=message.toolCalls)
-
-
-def rebuild_user_content_blocks(message: UserMessage) -> list[UserContentBlock]:
-    """从旧字段重建 user 内容块。"""
-
-    return normalize_user_content_blocks(message.content)
-
-
-def rebuild_tool_result_content_blocks(message: ToolResultMessage) -> list[ToolResultContentBlock]:
-    """从旧字段重建 tool result 内容块。"""
-
-    return normalize_tool_result_content_blocks(message.content)
-
-
 def ensure_message(value: ConversationMessage | dict[str, Any]) -> ConversationMessage:
-    """将输入值规范化为新的消息类型。"""
+    """将输入值规范化为统一消息对象。"""
 
     if isinstance(value, (UserMessage, AssistantMessage, ToolResultMessage)):
         return value
@@ -499,52 +599,107 @@ def ensure_message(value: ConversationMessage | dict[str, Any]) -> ConversationM
 
     role = value.get("role")
     if role == "user":
+        blocks = value.get("content")
+        if "contentBlocks" in value:
+            blocks = value["contentBlocks"]
         return UserMessage(
-            content=value.get("content", ""),
+            content=blocks,
             metadata=dict(value.get("metadata", {})),
-            contentBlocks=[ensure_content_block(item) for item in value.get("contentBlocks", [])],
-            timestamp=int(value.get("timestamp", int(time.time() * 1000))),
+            timestamp=int(value.get("timestamp", _now_ms())),
         )
     if role == "assistant":
-        tool_calls = [ensure_tool_call(item) for item in value.get("toolCalls", [])]
+        blocks = value.get("content")
+        if "contentBlocks" in value:
+            blocks = value["contentBlocks"]
         return AssistantMessage(
-            content=value.get("content", ""),
-            thinking=str(value.get("thinking", "")),
-            toolCalls=tool_calls,
+            content=blocks,
+            thinking=value.get("thinking"),
+            toolCalls=value.get("toolCalls"),
             metadata=dict(value.get("metadata", {})),
-            contentBlocks=[ensure_assistant_content_block(item) for item in value.get("contentBlocks", [])],
             usage=value.get("usage"),
             stopReason=value.get("stopReason"),
             responseId=value.get("responseId"),
             errorMessage=value.get("errorMessage"),
-            timestamp=int(value.get("timestamp", int(time.time() * 1000))),
+            timestamp=int(value.get("timestamp", _now_ms())),
         )
     if role in {"tool", "toolResult"}:
+        blocks = value.get("content")
+        if "contentBlocks" in value:
+            blocks = value["contentBlocks"]
         return ToolResultMessage(
             toolCallId=str(value.get("toolCallId", "")),
             toolName=str(value.get("toolName", "")),
-            content=value.get("content", ""),
+            content=blocks,
             metadata=dict(value.get("metadata", {})),
-            contentBlocks=[ensure_tool_result_content_block(item) for item in value.get("contentBlocks", [])],
             isError=bool(value.get("isError", value.get("metadata", {}).get("error", False))),
             details=value.get("details"),
-            timestamp=int(value.get("timestamp", int(time.time() * 1000))),
+            timestamp=int(value.get("timestamp", _now_ms())),
         )
     raise ValueError("message role must be one of: user, assistant, tool")
 
 
-def ensure_content_block(value: MessageContentBlock | dict[str, Any]) -> MessageContentBlock:
-    """将输入值规范化为内容块。"""
+def ensure_user_content_block(value: UserContentBlock | dict[str, Any] | Any) -> UserContentBlock:
+    """将输入值规范化为用户内容块。"""
 
-    if isinstance(value, (TextContent, ThinkingContent, ImageContent, ToolResultContent)):
+    if isinstance(value, (TextContent, ImageContent)):
         return value
     if not isinstance(value, dict):
         return TextContent(text=str(value))
+    if value.get("type") == "image":
+        return ImageContent(
+            data=str(value.get("data", "")),
+            mimeType=str(value.get("mimeType", "image/png")),
+            detail=value.get("detail"),
+            metadata=dict(value.get("metadata", {})),
+        )
+    return TextContent(text=str(value.get("text", value.get("content", ""))))
+
+
+def ensure_assistant_content_block(value: AssistantContentBlock | dict[str, Any] | Any) -> AssistantContentBlock:
+    """将输入值规范化为 assistant 内容块。"""
+
+    if isinstance(value, (TextContent, ThinkingContent, ImageContent, ToolCallContent)):
+        return value
+    if isinstance(value, ToolCall):
+        return ToolCallContent(id=value.id, name=value.name, arguments=value.arguments, metadata=dict(value.metadata))
+    if not isinstance(value, dict):
+        return TextContent(text=str(value))
+
     block_type = value.get("type")
     if block_type == "thinking":
         return ThinkingContent(thinking=str(value.get("thinking", "")))
     if block_type == "image":
-        return ImageContent(data=str(value.get("data", "")), mimeType=str(value.get("mimeType", "image/png")))
+        return ImageContent(
+            data=str(value.get("data", "")),
+            mimeType=str(value.get("mimeType", "image/png")),
+            detail=value.get("detail"),
+            metadata=dict(value.get("metadata", {})),
+        )
+    if block_type in {"tool_call", "toolCall"}:
+        return ToolCallContent(
+            id=str(value.get("id", "")),
+            name=str(value.get("name", "")),
+            arguments=value.get("arguments", {}),
+            metadata=dict(value.get("metadata", {})),
+        )
+    return TextContent(text=str(value.get("text", value.get("content", ""))))
+
+
+def ensure_tool_result_content_block(value: ToolResultContentBlock | dict[str, Any] | Any) -> ToolResultContentBlock:
+    """将输入值规范化为工具结果内容块。"""
+
+    if isinstance(value, (TextContent, ImageContent, ToolResultContent)):
+        return value
+    if not isinstance(value, dict):
+        return TextContent(text=str(value))
+    block_type = value.get("type")
+    if block_type == "image":
+        return ImageContent(
+            data=str(value.get("data", "")),
+            mimeType=str(value.get("mimeType", "image/png")),
+            detail=value.get("detail"),
+            metadata=dict(value.get("metadata", {})),
+        )
     if block_type == "tool_result_content":
         return ToolResultContent(
             text=str(value.get("text", "")),
@@ -553,34 +708,6 @@ def ensure_content_block(value: MessageContentBlock | dict[str, Any]) -> Message
             metadata=dict(value.get("metadata", {})),
         )
     return TextContent(text=str(value.get("text", value.get("content", ""))))
-
-
-def ensure_assistant_content_block(value: AssistantContentBlock | dict[str, Any]) -> AssistantContentBlock:
-    """将输入值规范化为 assistant 内容块。"""
-
-    if isinstance(value, ToolCallContent):
-        return value
-    if isinstance(value, (TextContent, ThinkingContent, ImageContent)):
-        return value
-    if not isinstance(value, dict):
-        return TextContent(text=str(value))
-    if value.get("type") in {"tool_call", "toolCall"}:
-        return ToolCallContent(
-            id=str(value.get("id", "")),
-            name=str(value.get("name", "")),
-            arguments=parse_tool_arguments(value.get("arguments", {})),
-            metadata=dict(value.get("metadata", {})),
-        )
-    return ensure_content_block(value)
-
-
-def ensure_tool_result_content_block(value: ToolResultContentBlock | dict[str, Any]) -> ToolResultContentBlock:
-    """将输入值规范化为 tool result 内容块。"""
-
-    block = ensure_content_block(value)
-    if isinstance(block, ThinkingContent):
-        return TextContent(text=block.thinking)
-    return block
 
 
 def ensure_tool(value: Tool | dict[str, Any]) -> Tool:
@@ -609,7 +736,7 @@ def ensure_tool_call(value: ToolCall | dict[str, Any]) -> ToolCall:
     return ToolCall(
         id=str(value.get("id", "")),
         name=str(value.get("name", "")),
-        arguments=parse_tool_arguments(value.get("arguments", "")),
+        arguments=value.get("arguments", {}),
         metadata=dict(value.get("metadata", {})),
     )
 

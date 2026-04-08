@@ -15,6 +15,8 @@ def build_reasoning_config(model: Any, reasoning: Any) -> dict[str, Any]:
 
     provider = getattr(model, "provider", None)
     if provider == "openai":
+        if level == "off":
+            return {}
         return {"reasoning": {"effort": level}}
     if provider == "anthropic":
         if level in {"off", "minimal"}:

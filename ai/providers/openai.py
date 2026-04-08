@@ -7,7 +7,7 @@ from typing import Any
 from ai.errors import AuthenticationError, ProviderResponseError
 from ai.options import Options
 from ai.providers.base import Provider
-from ai.types import AssistantMessage, StreamEvent, ToolCall
+from ai.types import AssistantMessage, StreamEvent, TextContent, ThinkingContent, ToolCallContent, parse_tool_arguments
 from ai.utils.streaming import EventBuilder, create_done_event
 
 
@@ -98,12 +98,12 @@ class OpenAIProvider(Provider):
             return {
                 "type": "function_call_output",
                 "call_id": getattr(message, "toolCallId"),
-                "output": getattr(message, "content", ""),
+                "output": getattr(message, "text", getattr(message, "content", "")),
             }
 
         payload: dict[str, Any] = {
             "role": getattr(message, "role", "user"),
-            "content": getattr(message, "content", ""),
+            "content": getattr(message, "text", getattr(message, "content", "")),
         }
         tool_calls = getattr(message, "toolCalls", [])
         if tool_calls:
@@ -172,7 +172,7 @@ class OpenAIProvider(Provider):
 
         client = AsyncOpenAI(**self._client_kwargs(options))
         builder = EventBuilder(model=model, provider=self.name)
-        final_message = AssistantMessage(content="", thinking="", toolCalls=[], metadata={})
+        final_message = AssistantMessage(content=[], metadata={})
         tool_buffers: dict[str, str] = {}
         text_started = False
         thinking_started = False
@@ -188,14 +188,14 @@ class OpenAIProvider(Provider):
                         if not text_started:
                             text_started = True
                             yield builder.build("text_start", rawEvent=raw_event)
-                        final_message.content += delta
+                        final_message.content.append(TextContent(text=delta))
                         yield builder.build("text_delta", text=delta, rawEvent=raw_event)
                     elif event_type in {"response.reasoning_text.delta", "response.reasoning_summary_text.delta"}:
                         delta = getattr(event, "delta", "")
                         if not thinking_started:
                             thinking_started = True
                             yield builder.build("thinking_start", rawEvent=raw_event)
-                        final_message.thinking += delta
+                        final_message.content.append(ThinkingContent(thinking=delta))
                         yield builder.build("thinking_delta", thinking=delta, rawEvent=raw_event)
                     elif event_type == "response.function_call_arguments.delta":
                         tool_call_id = getattr(event, "item_id", "")
@@ -210,7 +210,13 @@ class OpenAIProvider(Provider):
                         tool_call_id = getattr(event, "item_id", "")
                         tool_name = getattr(event, "name", None)
                         arguments = getattr(event, "arguments", tool_buffers.get(tool_call_id, ""))
-                        final_message.toolCalls.append(ToolCall(id=tool_call_id, name=tool_name or "", arguments=arguments))
+                        final_message.content.append(
+                            ToolCallContent(
+                                id=tool_call_id,
+                                name=tool_name or "",
+                                arguments=parse_tool_arguments(arguments),
+                            )
+                        )
                         yield builder.build("toolcall_end", toolCallId=tool_call_id, toolName=tool_name, arguments=arguments, rawEvent=raw_event)
 
                 if text_started:

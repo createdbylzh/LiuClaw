@@ -292,7 +292,8 @@ async def test_complete_aggregates_done_message_from_queue(
     assert message.content == "hello"
     assert message.thinking == "need lookup"
     assert message.toolCalls[0].name == "lookup_spec"
-    assert message.toolCalls[0].arguments == '{"query":"llm"}'
+    assert message.toolCalls[0].arguments == {"query": "llm"}
+    assert message.toolCalls[0].arguments_text == '{"query":"llm"}'
 
 
 @pytest.mark.asyncio
