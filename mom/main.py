@@ -17,12 +17,15 @@ from .types import ChannelState, ChatEvent, MomRenderConfig
 
 @dataclass(slots=True)
 class MomConfig:
+    """mom 应用配置，负责承载工作区与飞书接入参数。"""
+
     workspace_root: Path
     feishu: FeishuConfig
     model_id: str | None = None
 
     @classmethod
     def from_env(cls) -> "MomConfig":
+        """从环境变量读取 mom 启动配置。"""
         workspace_root = Path(os.environ["MOM_WORKDIR"]).resolve()
         return cls(
             workspace_root=workspace_root,
@@ -41,6 +44,7 @@ class MomConfig:
 
 class MomApp:
     def __init__(self, config: MomConfig, *, transport: FeishuBotTransport | None = None, stream_fn=None) -> None:
+        """初始化 mom 主应用，装配存储、模型、传输层和事件监听器。"""
         self.config = config
         self.stream_fn = stream_fn
         self.store = MomStore(config.workspace_root)
@@ -54,6 +58,7 @@ class MomApp:
         self.render_config = self._load_render_config()
 
     def _load_render_config(self) -> MomRenderConfig:
+        """读取渲染配置，优先使用 mom 本地设置，其次读取环境变量。"""
         settings = self.store.load_settings()
         return MomRenderConfig(
             render_mode=str(settings.get("render_mode") or os.environ.get("MOM_RENDER_MODE") or "final_only"),
@@ -76,11 +81,13 @@ class MomApp:
 
     @staticmethod
     def _read_bool(raw: str | None, default: bool) -> bool:
+        """把字符串型开关值解析为布尔值。"""
         if raw is None:
             return bool(default)
         return raw.strip().lower() in {"1", "true", "yes", "on"}
 
     def get_state(self, chat_id: str) -> ChannelState:
+        """获取频道运行态；如果不存在则为该频道创建一份状态对象。"""
         state = self.channel_states.get(chat_id)
         if state is None:
             state = ChannelState(store=self.store)
@@ -89,10 +96,12 @@ class MomApp:
 
     @staticmethod
     def _should_dedupe(event: ChatEvent) -> bool:
+        """判断当前事件是否需要做去重处理。"""
         return not bool(event.metadata.get("synthetic"))
 
     @staticmethod
     def _remember_message_id(state: ChannelState, message_id: str) -> None:
+        """记录最近处理过的消息 ID，避免重复消费飞书事件。"""
         if not message_id:
             return
         state.recent_incoming_message_ids = [
@@ -103,6 +112,7 @@ class MomApp:
             state.recent_incoming_message_ids = state.recent_incoming_message_ids[-200:]
 
     async def handle_chat_event(self, event: ChatEvent) -> None:
+        """处理单条聊天事件，包括去重、停止指令和串行调度控制。"""
         state = self.get_state(event.chat_id)
         if self._should_dedupe(event) and event.message_id in state.recent_incoming_message_ids:
             return
@@ -132,6 +142,7 @@ class MomApp:
         await self._run_event(event, state)
 
     async def _run_event(self, event: ChatEvent, state: ChannelState) -> None:
+        """真正执行一次频道任务，并在结束后继续消费排队事件。"""
         state.running = True
         state.stop_requested = False
         ctx = self.transport.create_context(event, self.store)
@@ -167,11 +178,13 @@ class MomApp:
             await self._run_event(next_event, state)
 
     async def run(self) -> None:
+        """启动事件监听并进入飞书服务主循环。"""
         self.events.start()
         await self.transport.serve(self.store)
 
 
 def main() -> int:
+    """命令行入口：构造应用并启动事件循环。"""
     config = MomConfig.from_env()
     asyncio.run(MomApp(config).run())
     return 0

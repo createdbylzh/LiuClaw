@@ -21,6 +21,7 @@ def build_mom_system_prompt(
     chats: list[ChatInfo],
     channel_memory: str,
 ) -> str:
+    """构造 mom 专用系统提示词，向 Agent 注入平台环境、目录约定和频道上下文。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     chat_lines = "\n".join(f"- {item.id}: {item.name}" for item in chats) if chats else "- (none loaded)"
     user_lines = "\n".join(f"- {item.id}: {item.name}" for item in users) if users else "- (none loaded)"

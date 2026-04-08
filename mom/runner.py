@@ -19,12 +19,14 @@ from .types import ChatAttachment, ChatContext, ChatInfo, ChatUser, MomRenderCon
 
 
 def _read_memory(path: Path) -> str:
+    """读取频道记忆文件内容。"""
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8")
 
 
 def _format_event_message(sender_name: str, text: str, attachments: list[ChatAttachment]) -> str:
+    """把当前触发消息格式化成注入 Agent 的用户输入文本。"""
     body = f"[{sender_name}]: {text}".strip()
     if attachments:
         lines = ["", "<attachments>"]
@@ -47,6 +49,7 @@ class MomAgentSession(AgentSession):
         chats: list[ChatInfo],
         **kwargs,
     ) -> None:
+        """扩展 AgentSession，为 mom 场景注入平台与频道上下文。"""
         self.platform_name = platform_name
         self.mom_store = mom_store
         self.chat_id = chat_id
@@ -56,12 +59,14 @@ class MomAgentSession(AgentSession):
         super().__init__(**kwargs)
 
     def update_chat_directory(self, chat_name: str | None, users: list[ChatUser], chats: list[ChatInfo]) -> None:
+        """更新频道上下文，并重建系统提示词。"""
         self.chat_name = chat_name
         self.chat_users = users
         self.chat_infos = chats
         self._agent.setSystemPrompt(self._build_system_prompt())
 
     def _build_system_prompt(self) -> str:
+        """构造当前频道专用的系统提示词。"""
         context = build_session_context(
             workspace_root=self.workspace_root,
             cwd=self.cwd,
@@ -84,16 +89,19 @@ class MomAgentSession(AgentSession):
         )
 
     async def _before_tool_call(self, context):  # type: ignore[override]
+        """记录本轮发生过工具调用，允许工具继续执行。"""
         self._tool_activity_in_run = True
         _ = context
         return BeforeToolCallAllow()
 
     async def _after_tool_call(self, context):  # type: ignore[override]
+        """记录工具调用结束事件，不额外打断会话流程。"""
         self._tool_activity_in_run = True
         _ = context
         return AfterToolCallPass()
 
     async def _follow_up(self, state, signal=None):  # type: ignore[override]
+        """禁用默认 follow-up 逻辑，避免群聊机器人产生额外尾随消息。"""
         _ = state, signal
         return []
 
@@ -113,6 +121,7 @@ class MomRunner:
         render_config: MomRenderConfig | None = None,
         stream_fn=None,
     ) -> None:
+        """初始化频道级 runner，负责驱动 Agent 会话并把结果回写聊天平台。"""
         self.platform_name = platform_name
         self.chat_id = chat_id
         self.chat_dir = chat_dir
@@ -150,9 +159,11 @@ class MomRunner:
         )
 
     def abort(self) -> None:
+        """中断当前 Agent 执行。"""
         self.session.cancel()
 
     async def run(self, ctx: ChatContext, store: MomStore) -> RunResult:
+        """执行一次聊天请求，包括同步历史、运行 Agent 和输出结果。"""
         self.session.update_chat_directory(ctx.chat_name, ctx.users, ctx.chats)
         sync_channel_log_to_session(self.session_manager, self.session_ref, self.chat_dir, exclude_message_id=ctx.message.message_id)
         store.save_session_ref(self.chat_id, self.session_ref)
@@ -220,6 +231,7 @@ class MomRunner:
         detail_count: int,
         suppressed_events_count: int,
     ) -> tuple[str, str | None, str, int, int]:
+        """处理 SessionEvent，并根据渲染配置决定是否对外展示。"""
         if event.type == "message_delta":
             main_text += event.delta
             if self.render_config.render_mode == "streaming" and self.render_config.show_intermediate_updates:
@@ -290,6 +302,7 @@ def get_or_create_runner(
     render_config: MomRenderConfig | None = None,
     stream_fn=None,
 ) -> MomRunner:
+    """按频道复用 runner，避免同一频道重复创建会话执行器。"""
     runner = _RUNNERS.get(chat_id)
     if runner is not None:
         runner.session_ref = session_ref

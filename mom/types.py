@@ -8,11 +8,14 @@ from typing import Any, Literal
 
 
 def utc_now_iso() -> str:
+    """返回当前 UTC 时间的 ISO 8601 字符串。"""
     return datetime.now(timezone.utc).isoformat()
 
 
 @dataclass(slots=True)
 class ChatAttachment:
+    """聊天消息中的附件信息。"""
+
     original_name: str
     local_path: str = ""
     mime_type: str | None = None
@@ -24,6 +27,8 @@ class ChatAttachment:
 
 @dataclass(slots=True)
 class ChatEvent:
+    """统一后的聊天事件模型，作为 mom 内部的核心输入。"""
+
     platform: str
     chat_id: str
     message_id: str
@@ -41,6 +46,8 @@ class ChatEvent:
 
 @dataclass(slots=True)
 class ChatUser:
+    """聊天参与者信息。"""
+
     id: str
     name: str
     display_name: str | None = None
@@ -48,6 +55,8 @@ class ChatUser:
 
 @dataclass(slots=True)
 class ChatInfo:
+    """聊天会话的基础信息。"""
+
     id: str
     name: str
 
@@ -62,6 +71,8 @@ DeleteFn = Callable[[], Awaitable[None]]
 
 @dataclass(slots=True)
 class ChatContext:
+    """runner 与外部聊天平台之间的交互抽象。"""
+
     message: ChatEvent
     chat_name: str | None
     users: list[ChatUser]
@@ -77,6 +88,8 @@ class ChatContext:
 
 @dataclass(slots=True)
 class RunResult:
+    """一次 Agent 执行结束后的汇总结果。"""
+
     stop_reason: Literal["completed", "aborted", "error"] = "completed"
     error_message: str | None = None
     main_message_id: str | None = None
@@ -87,6 +100,8 @@ class RunResult:
 
 @dataclass(slots=True)
 class MomRenderConfig:
+    """mom 输出渲染策略配置。"""
+
     render_mode: Literal["final_only", "streaming"] = "final_only"
     placeholder_text: str = "处理中…"
     show_intermediate_updates: bool = False
@@ -96,6 +111,8 @@ class MomRenderConfig:
 
 @dataclass(slots=True)
 class SessionRef:
+    """频道与 Agent 会话之间的持久化引用。"""
+
     session_id: str
     branch_id: str = "main"
     synced_message_ids: list[str] = field(default_factory=list)
@@ -103,6 +120,8 @@ class SessionRef:
 
 @dataclass(slots=True)
 class ChannelState:
+    """频道级运行态，记录是否忙碌、排队消息和停止状态。"""
+
     running: bool = False
     runner: Any | None = None
     store: Any | None = None
@@ -115,6 +134,8 @@ class ChannelState:
 
 @dataclass(slots=True)
 class LoggedChatMessage:
+    """写入频道日志文件的标准消息结构。"""
+
     platform: str
     chat_id: str
     message_id: str
@@ -132,6 +153,8 @@ class LoggedChatMessage:
 
 @dataclass(slots=True)
 class MomPaths:
+    """mom 在工作区下使用的目录与文件路径集合。"""
+
     workspace_root: Path
     root: Path
     channels_dir: Path
@@ -141,6 +164,7 @@ class MomPaths:
     channel_index_file: Path
 
     def ensure_exists(self) -> None:
+        """确保 mom 运行依赖的目录和配置文件已经存在。"""
         self.root.mkdir(parents=True, exist_ok=True)
         self.channels_dir.mkdir(parents=True, exist_ok=True)
         self.events_dir.mkdir(parents=True, exist_ok=True)

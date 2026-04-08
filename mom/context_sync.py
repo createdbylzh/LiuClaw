@@ -10,6 +10,7 @@ from .types import SessionRef
 
 
 def _format_log_entry_for_agent(entry: dict) -> str:
+    """把日志中的历史消息转换成适合注入 Agent 上下文的文本格式。"""
     created_at = str(entry.get("created_at") or "")
     sender = str(entry.get("sender_name") or entry.get("sender_id") or "unknown")
     prefix = ""
@@ -38,6 +39,7 @@ def sync_channel_log_to_session(
     channel_dir: Path,
     exclude_message_id: str | None = None,
 ) -> int:
+    """把频道日志里的用户消息同步到会话树，避免 Agent 丢失历史上下文。"""
     log_file = channel_dir / "log.jsonl"
     if not log_file.exists():
         return 0

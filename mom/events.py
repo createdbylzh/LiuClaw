@@ -12,18 +12,22 @@ from .types import ChatEvent
 
 @dataclass(slots=True)
 class EventRecord:
+    """事件文件中定义的通用事件记录结构。"""
+
     name: str
     data: dict[str, Any]
 
 
 class EventsWatcher:
     def __init__(self, events_dir: Path, dispatch) -> None:
+        """初始化事件目录监听器，按轮询方式消费本地事件文件。"""
         self.events_dir = events_dir
         self.dispatch = dispatch
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
     async def scan_once(self) -> None:
+        """扫描一次事件目录，并把到期事件转发给上层处理器。"""
         self.events_dir.mkdir(parents=True, exist_ok=True)
         for path in sorted(self.events_dir.glob("*.json")):
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -35,6 +39,7 @@ class EventsWatcher:
                 path.unlink(missing_ok=True)
 
     def _build_chat_event(self, path: Path, payload: dict[str, Any]) -> ChatEvent | None:
+        """把事件文件内容转换成内部 ChatEvent，并处理触发时机。"""
         event_type = payload.get("type")
         if event_type not in {"immediate", "one-shot", "periodic"}:
             return None
@@ -70,6 +75,7 @@ class EventsWatcher:
         )
 
     async def run(self, interval_seconds: float = 1.0) -> None:
+        """持续轮询事件目录，直到收到停止信号。"""
         while not self._stop.is_set():
             await self.scan_once()
             try:
@@ -78,11 +84,13 @@ class EventsWatcher:
                 continue
 
     def start(self, interval_seconds: float = 1.0) -> asyncio.Task:
+        """启动后台轮询任务。"""
         self._stop.clear()
         self._task = asyncio.create_task(self.run(interval_seconds=interval_seconds))
         return self._task
 
     async def stop(self) -> None:
+        """停止后台轮询任务并等待退出。"""
         self._stop.set()
         if self._task is not None:
             await self._task

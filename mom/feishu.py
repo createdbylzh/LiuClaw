@@ -18,6 +18,7 @@ _FEISHU_TEXT_LIMIT = 4000
 
 
 def _strip_mentions(text: str, mentions: list[str]) -> str:
+    """移除消息文本中的 @ 提及内容，保留真正的用户意图。"""
     normalized = text
     for mention in mentions:
         normalized = normalized.replace(mention, "")
@@ -25,6 +26,7 @@ def _strip_mentions(text: str, mentions: list[str]) -> str:
 
 
 def _normalize_text_message(text: str) -> str:
+    """规范化飞书文本消息，过滤非法字符并控制长度。"""
     cleaned = "".join(ch for ch in str(text) if ch in "\n\t" or ord(ch) >= 32)
     cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not cleaned:
@@ -36,6 +38,8 @@ def _normalize_text_message(text: str) -> str:
 
 @dataclass(slots=True)
 class FeishuConfig:
+    """飞书接入配置，包含鉴权参数和服务监听方式。"""
+
     app_id: str
     app_secret: str
     connection_mode: str = "long_connection"
@@ -48,6 +52,7 @@ class FeishuConfig:
 
 class FeishuBotTransport:
     def __init__(self, handler, config: FeishuConfig, *, client: httpx.AsyncClient | None = None) -> None:
+        """初始化飞书传输层，负责消息收发、事件解析和上下文封装。"""
         self.handler = handler
         self.config = config
         self.client = client or httpx.AsyncClient(timeout=20.0)
@@ -56,9 +61,11 @@ class FeishuBotTransport:
         self._chats: dict[str, ChatInfo] = {}
 
     async def close(self) -> None:
+        """关闭底层 HTTP 客户端连接。"""
         await self.client.aclose()
 
     async def get_tenant_access_token(self) -> str:
+        """获取并缓存飞书 tenant_access_token。"""
         if self._tenant_access_token:
             return self._tenant_access_token
         response = await self.client.post(
@@ -71,6 +78,7 @@ class FeishuBotTransport:
         return self._tenant_access_token
 
     async def _request(self, method: str, path: str, **kwargs) -> dict[str, Any]:
+        """统一封装带鉴权的飞书 OpenAPI 请求。"""
         headers = dict(kwargs.pop("headers", {}))
         headers["Authorization"] = f"Bearer {await self.get_tenant_access_token()}"
         response = await self.client.request(method, f"{self.config.base_url}{path}", headers=headers, **kwargs)
@@ -84,6 +92,7 @@ class FeishuBotTransport:
         return response.json()
 
     async def _create_message(self, receive_id: str, receive_id_type: str, payload: dict[str, Any]) -> str | None:
+        """调用飞书消息发送接口创建一条消息。"""
         data = await self._request(
             "POST",
             f"/im/v1/messages?receive_id_type={receive_id_type}",
@@ -100,6 +109,7 @@ class FeishuBotTransport:
         open_id: str | None = None,
         is_direct: bool = False,
     ) -> str | None:
+        """发送文本消息；优先走回复，失败后回退到普通发消息。"""
         payload = {"msg_type": "text", "content": json.dumps({"text": _normalize_text_message(text)}, ensure_ascii=False)}
         reply_error: Exception | None = None
         if reply_to:
@@ -118,6 +128,7 @@ class FeishuBotTransport:
             raise
 
     async def update_text(self, message_id: str, text: str) -> str | None:
+        """更新已发送消息的正文，用于流式输出或占位消息替换。"""
         try:
             await self._request("PATCH", f"/im/v1/messages/{message_id}", json={"content": json.dumps({"text": text}, ensure_ascii=False)})
             return message_id
@@ -133,6 +144,7 @@ class FeishuBotTransport:
         open_id: str | None = None,
         is_direct: bool = False,
     ) -> str | None:
+        """上传本地文件到飞书，并把文件消息发送到目标会话。"""
         path = Path(file_path)
         with path.open("rb") as handle:
             data = await self._request("POST", "/im/v1/files", files={"file": (title or path.name, handle)})
@@ -151,6 +163,7 @@ class FeishuBotTransport:
             raise
 
     async def download_attachment(self, attachment: ChatAttachment) -> bytes:
+        """下载飞书消息中的附件二进制内容。"""
         file_key = attachment.file_key or attachment.metadata.get("file_key")
         if not file_key:
             raise ValueError("attachment file_key is required")
@@ -164,6 +177,7 @@ class FeishuBotTransport:
         return response.content
 
     def create_context(self, event: ChatEvent, store: MomStore) -> ChatContext:
+        """把飞书事件包装成运行期 ChatContext，供 runner 统一调用。"""
         response_holder = {"main": None}
 
         async def respond(text: str, log: bool = True) -> str | None:
@@ -229,6 +243,7 @@ class FeishuBotTransport:
         )
 
     async def ingest_callback(self, payload: dict[str, Any], store: MomStore) -> dict[str, Any]:
+        """处理 webhook 模式的回调请求，并写入本地事件日志。"""
         if payload.get("type") == "url_verification":
             return {"challenge": payload.get("challenge", "")}
         token = payload.get("token") or payload.get("header", {}).get("token", "")
@@ -242,6 +257,7 @@ class FeishuBotTransport:
         return {"code": 0}
 
     async def ingest_long_connection_event(self, payload: dict[str, Any], store: MomStore) -> None:
+        """处理长连接模式收到的事件，并立即分发给应用层。"""
         event = self.parse_event(payload)
         if event is None:
             return
@@ -249,6 +265,7 @@ class FeishuBotTransport:
         await self.handler.handle_chat_event(event)
 
     def parse_event(self, payload: dict[str, Any]) -> ChatEvent | None:
+        """把飞书原始事件解析为内部统一的 ChatEvent。"""
         event = payload.get("event") or payload.get("data", {}).get("event") or payload.get("data") or {}
         message = event.get("message") or {}
         sender = event.get("sender") or {}
@@ -303,6 +320,7 @@ class FeishuBotTransport:
         return event_obj
 
     async def _serve_webhook(self, store: MomStore) -> None:
+        """以本地 HTTP 服务方式接收飞书 webhook 回调。"""
         loop = asyncio.get_running_loop()
         transport = self
 
@@ -326,6 +344,7 @@ class FeishuBotTransport:
         await loop.run_in_executor(None, server.serve_forever)
 
     def _marshal_lark_payload(self, raw_event: Any, lark_module: Any) -> dict[str, Any] | None:
+        """把长连接 SDK 提供的事件对象转成标准字典结构。"""
         if isinstance(raw_event, dict):
             return raw_event
         payload_text = lark_module.JSON.marshal(raw_event)
@@ -337,6 +356,7 @@ class FeishuBotTransport:
         return {"event": payload}
 
     def _build_long_connection_client(self, store: MomStore, loop: asyncio.AbstractEventLoop) -> Any:
+        """构造飞书长连接客户端，并绑定消息事件回调。"""
         try:
             import lark_oapi as lark
         except ImportError as exc:
@@ -359,6 +379,7 @@ class FeishuBotTransport:
         return lark.ws.Client(self.config.app_id, self.config.app_secret, event_handler=event_handler)
 
     async def _serve_long_connection(self, store: MomStore) -> None:
+        """以长连接模式接入飞书事件流。"""
         loop = asyncio.get_running_loop()
 
         # lark_oapi.ws.Client captures an event loop during construction and then
@@ -371,6 +392,7 @@ class FeishuBotTransport:
         await asyncio.to_thread(run_client)
 
     async def serve(self, store: MomStore) -> None:
+        """根据配置选择 webhook 或长连接模式启动飞书服务。"""
         mode = self.config.connection_mode.strip().lower()
         if mode in {"webhook", "http"}:
             await self._serve_webhook(store)
