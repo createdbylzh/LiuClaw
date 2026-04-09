@@ -9,7 +9,7 @@ from typing import Any
 
 from ai.types import AssistantMessage, ConversationMessage, ToolCall, ToolResultMessage, UserMessage
 
-from .types import ControlMessage, PersistedMessageNode, SessionSnapshot, conversation_to_node_payload
+from .types import PersistedMessageNode, SessionSnapshot, conversation_to_node_payload
 
 
 class SessionManager:
@@ -56,18 +56,6 @@ class SessionManager:
         for event in self.iter_events(session_id):
             if event["type"] == "message":
                 snapshot.nodes.append(PersistedMessageNode(**event["payload"]))
-            elif event["type"] == "control":
-                snapshot.nodes.append(
-                    PersistedMessageNode(
-                        id=str(event["payload"]["id"]),
-                        role="control",
-                        content=str(event["payload"]["content"]),
-                        parent_id=event["payload"].get("parent_id"),
-                        branch_id=str(event["payload"]["branch_id"]),
-                        message_type="control",
-                        metadata=dict(event["payload"].get("metadata", {})),
-                    )
-                )
             elif event["type"] == "summary":
                 snapshot.summaries.append(event["payload"])
             elif event["type"] == "branch_switch":
@@ -110,42 +98,6 @@ class SessionManager:
             {"type": "summary", "payload": {"branch_id": branch_id, "summary": summary, "node_ids": node_ids}},
         )
         self._touch_meta(session_id)
-
-    def append_control(
-        self,
-        session_id: str,
-        *,
-        message: ControlMessage,
-        branch_id: str,
-        parent_id: str | None,
-        node_id: str | None = None,
-    ) -> PersistedMessageNode:
-        """追加一条显式控制消息事件，不混入普通业务消息流。"""
-
-        node = PersistedMessageNode(
-            id=node_id or uuid.uuid4().hex[:12],
-            role="control",
-            content=message.content,
-            parent_id=parent_id,
-            branch_id=branch_id,
-            message_type="control",
-            metadata={"control_kind": message.kind, **dict(message.metadata)},
-        )
-        self._append_event(
-            session_id,
-            {
-                "type": "control",
-                "payload": {
-                    "id": node.id,
-                    "content": node.content,
-                    "parent_id": parent_id,
-                    "branch_id": branch_id,
-                    "metadata": dict(node.metadata),
-                },
-            },
-        )
-        self._touch_meta(session_id)
-        return node
 
     def switch_branch(self, session_id: str, from_branch: str, to_branch: str) -> None:
         """记录分支切换事件，并更新当前分支元信息。"""

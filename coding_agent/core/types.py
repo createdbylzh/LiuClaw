@@ -110,15 +110,6 @@ class ExtensionRuntime:
 
 
 @dataclass(slots=True)
-class ControlMessage:
-    """表示 steering 或 follow-up 这类显式控制消息。"""
-
-    kind: Literal["steering", "follow_up", "custom"]  # 控制消息类型。
-    content: str  # 控制消息正文。
-    metadata: dict[str, Any] = field(default_factory=dict)  # 控制消息附加元信息。
-
-
-@dataclass(slots=True)
 class ToolExecutionContext:
     """描述一次工具执行前后可见的安全上下文。"""
 

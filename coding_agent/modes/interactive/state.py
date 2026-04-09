@@ -253,17 +253,6 @@ class InteractiveState:
             visible_output = True
         elif event.type == "status":
             self.add_status(event.message)
-            if event.source in {"steering", "follow_up"} and turn is not None and event.message:
-                block = TranscriptBlock(
-                    id=event.message_id or f"{turn.turn_id}-status-{len(turn.status_blocks) + 1}",
-                    kind="status",
-                    title="Status",
-                    body=event.message,
-                    source=event.source or "status",
-                    render_order=event.render_order or 230,
-                )
-                turn.status_blocks.append(block)
-                visible_output = True
         elif event.type == "tool_start":
             if turn is None:
                 return False

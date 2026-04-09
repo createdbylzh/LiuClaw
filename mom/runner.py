@@ -100,12 +100,6 @@ class MomAgentSession(AgentSession):
         _ = context
         return AfterToolCallPass()
 
-    async def _follow_up(self, state, signal=None):  # type: ignore[override]
-        """禁用默认 follow-up 逻辑，避免群聊机器人产生额外尾随消息。"""
-        _ = state, signal
-        return []
-
-
 class MomRunner:
     def __init__(
         self,

@@ -791,7 +791,9 @@ async def runLoop(
     first_inner_turn = True
 
     while True:
-        while first_inner_turn or pending_messages:
+        has_more_tool_calls = True
+
+        while has_more_tool_calls or first_inner_turn or pending_messages:
             signal.throw_if_aborted()
             if not first_turn_started or not first_inner_turn:
                 state.runtime_flags.turnIndex += 1
@@ -811,7 +813,8 @@ async def runLoop(
                 await _emit_event(queue, event_type="agent_end", state=state, payload={"error": state.error})
                 return
 
-            if assistant_message.toolCalls:
+            has_more_tool_calls = bool(assistant_message.toolCalls)
+            if has_more_tool_calls:
                 await executeToolCalls(assistant_message, state, loop, queue, signal)
 
             await _emit_event(queue, event_type="turn_end", state=state, payload={"turnIndex": state.runtime_flags.turnIndex})
@@ -819,7 +822,8 @@ async def runLoop(
             pending_messages = [ _copy_payload_value(message) for message in await _resolve_control_messages(loop.get_steering_messages, state, signal)]
             if pending_messages:
                 continue
-            break
+            if not has_more_tool_calls:
+                break
 
         follow_up_messages = await _resolve_control_messages(loop.get_follow_up_messages, state, signal)
         if follow_up_messages:

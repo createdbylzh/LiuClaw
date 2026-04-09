@@ -190,11 +190,11 @@ async def test_mom_runner_logs_detail_and_main_messages(tmp_path: Path, stub_mod
     log_entries = store.read_log_entries("chat-2")
 
     assert result.stop_reason == "completed"
-    assert [text for kind, text in messages if kind == "main"][-1] == "draft"
+    assert [text for kind, text in messages if kind == "main"][-1] == "final answer"
     assert all(kind != "detail" for kind, _ in messages)
-    assert result.final_text == "draft"
+    assert result.final_text == "final answer"
     assert result.detail_count == 0
-    assert any(entry["is_bot"] and entry["text"] == "draft" for entry in log_entries)
+    assert any(entry["is_bot"] and entry["text"] == "final answer" for entry in log_entries)
     assert "history-1" in ref.synced_message_ids
 
 

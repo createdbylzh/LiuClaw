@@ -21,7 +21,7 @@ from coding_agent.core.session_manager import SessionManager
 from coding_agent.core.settings_manager import SettingsManager
 from coding_agent.core.tools import build_default_tools, build_tool_registry
 from coding_agent.core.runtime_assembly import build_session_context
-from coding_agent.core.types import CodingAgentSettings, ControlMessage, SessionEvent, ToolPolicy
+from coding_agent.core.types import CodingAgentSettings, SessionEvent, ToolPolicy
 from coding_agent.modes.interactive.controller import InteractiveController
 from coding_agent.modes.interactive.renderer import InteractiveRenderer
 from coding_agent.modes.interactive.state import InteractiveState, TranscriptBlock, TranscriptTurn
@@ -277,7 +277,7 @@ def test_system_prompt_advertises_skill_descriptions_only(tmp_path: Path, stub_m
 
 
 @pytest.mark.asyncio
-async def test_agent_session_uses_steering_and_follow_up(tmp_path: Path, stub_model: Model) -> None:
+async def test_agent_session_ends_naturally_after_tool_results(tmp_path: Path, stub_model: Model) -> None:
     settings = CodingAgentSettings(default_model=stub_model.id)
     home_root = tmp_path / "home"
     paths = build_agent_paths(home_root)
@@ -294,18 +294,6 @@ async def test_agent_session_uses_steering_and_follow_up(tmp_path: Path, stub_mo
     session_manager = SessionManager(paths.sessions_dir)
 
     async def fake_stream(model, context, thinking, registry=None):
-        if any(getattr(message, "metadata", {}).get("follow_up") for message in context.history if getattr(message, "role", "") == "user"):
-            return FakeSession(
-                [
-                    StreamEvent(type="start", provider="stub", model=stub_model),
-                    StreamEvent(
-                        type="done",
-                        provider="stub",
-                        model=stub_model,
-                        assistantMessage=AssistantMessage(content="final answer"),
-                    ),
-                ]
-            )
         if any(getattr(message, "role", "") == "tool" for message in context.history):
             return FakeSession(
                 [
@@ -348,15 +336,70 @@ async def test_agent_session_uses_steering_and_follow_up(tmp_path: Path, stub_mo
     restored = session_manager.build_context_messages(agent_session.session_id)
     raw_events = session_manager.iter_events(agent_session.session_id)
 
-    status_sources = [event.payload.get("source") for event in events if event.type == "status"]
-    persisted_control_events = [event for event in raw_events if event["type"] == "control"]
+    assert all(event.type != "status" for event in events)
+    assert events[-1].message == "draft answer"
+    assert [message.content for message in restored if getattr(message, "role", "") == "user"] == ["inspect workspace"]
+    assert all(event["type"] != "control" for event in raw_events)
 
-    assert "steering" in status_sources
-    assert "follow_up" in status_sources
-    assert events[-1].message == "final answer"
-    assert all(not getattr(message, "metadata", {}).get("steering") for message in restored if getattr(message, "role", "") == "user")
-    assert any(event["payload"]["metadata"].get("control_kind") == "steering" for event in persisted_control_events)
-    assert any(event["payload"]["metadata"].get("control_kind") == "follow_up" for event in persisted_control_events)
+
+@pytest.mark.asyncio
+async def test_agent_session_can_queue_steering_and_follow_up_messages(tmp_path: Path, stub_model: Model) -> None:
+    settings = CodingAgentSettings(default_model=stub_model.id)
+    home_root = tmp_path / "home"
+    paths = build_agent_paths(home_root)
+    paths.ensure_exists()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    resource_loader = ResourceLoader(
+        skills_dir=paths.skills_dir,
+        prompts_dir=paths.prompts_dir,
+        themes_dir=paths.themes_dir,
+        extensions_dir=paths.extensions_dir,
+        workspace_root=workspace,
+    )
+    session_manager = SessionManager(paths.sessions_dir)
+
+    async def fake_stream(model, context, thinking, registry=None):
+        latest_user = next(message.content for message in reversed(context.history) if getattr(message, "role", "") == "user")
+        return FakeSession(
+            [
+                StreamEvent(type="start", provider="stub", model=stub_model),
+                StreamEvent(
+                    type="done",
+                    provider="stub",
+                    model=stub_model,
+                    assistantMessage=AssistantMessage(content=f"echo:{latest_user}"),
+                ),
+            ]
+        )
+
+    agent_session = AgentSession(
+        workspace_root=workspace,
+        cwd=workspace,
+        model=stub_model,
+        thinking="medium",
+        settings=settings,
+        session_manager=session_manager,
+        resource_loader=resource_loader,
+        stream_fn=fake_stream,
+    )
+    agent_session.send_user_message("hello")
+    first_events = [event async for event in agent_session.run_turn()]
+
+    agent_session.steer("queued steer")
+    steer_events = [event async for event in agent_session.run_turn()]
+    agent_session.follow_up("queued follow")
+    follow_events = [event async for event in agent_session.run_turn()]
+    restored = session_manager.build_context_messages(agent_session.session_id)
+
+    assert first_events[-1].message == "echo:hello"
+    assert steer_events[-1].message == "echo:queued steer"
+    assert follow_events[-1].message == "echo:queued follow"
+    assert [message.content for message in restored if getattr(message, "role", "") == "user"] == [
+        "hello",
+        "queued steer",
+        "queued follow",
+    ]
 
 
 @pytest.mark.asyncio
@@ -623,7 +666,6 @@ def test_interactive_state_builds_transcript_without_blank_assistant_blocks() ->
     state.apply_event(SessionEvent(type="tool_end", tool_name="read", message="ok", tool_output_preview="ok", message_id="t1", turn_id="turn-1"))
 
     assert state.transcript_text.count("[Assistant]") == 1
-    assert "[Status]\n准备执行工具" in state.transcript_text
     assert "[Thinking]\n先分析文件结构" in state.transcript_text
     assert "[Tool:read] success\nargs: {\"path\":\"a.txt\"}\nok" in state.transcript_text
     assert state.transcript_text.index("[User]") < state.transcript_text.index("[Thinking]") < state.transcript_text.index("[Tool:read] success") < state.transcript_text.index("[Assistant]")
@@ -890,19 +932,13 @@ def test_resource_loader_loads_python_extension_runtime_and_tool_registry(tmp_pa
     assert any(tool.name == "demo_tool" for tool in registry.active_tools)
 
 
-def test_session_manager_persists_control_events_separately(tmp_path: Path) -> None:
+def test_session_manager_persists_only_message_events(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "sessions")
     snapshot = manager.create_session(cwd=tmp_path, model_id="openai:gpt-5")
     manager.append_message(snapshot.session_id, message=UserMessage(content="hello"), branch_id=snapshot.branch_id, parent_id=None)
-    manager.append_control(
-        snapshot.session_id,
-        message=ControlMessage(kind="steering", content="control-text", metadata={"phase": "before_tool"}),
-        branch_id=snapshot.branch_id,
-        parent_id=None,
-    )
 
     messages = manager.build_context_messages(snapshot.session_id)
     events = manager.iter_events(snapshot.session_id)
 
-    assert all(getattr(message, "role", "") != "control" for message in messages)
-    assert any(event["type"] == "control" for event in events)
+    assert [message.content for message in messages] == ["hello"]
+    assert [event["type"] for event in events] == ["message"]

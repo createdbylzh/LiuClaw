@@ -23,7 +23,7 @@ from .compaction import CompactionCoordinator
 from .resource_loader import ResourceLoader
 from .runtime_assembly import SessionRuntimeAssembly, assemble_session_runtime, build_runtime_context_messages, build_session_context
 from .session_manager import SessionManager
-from .types import CodingAgentSettings, ControlMessage, SessionEvent
+from .types import CodingAgentSettings, SessionEvent
 
 
 class AgentSession:
@@ -60,9 +60,6 @@ class AgentSession:
         self._current_assistant_message_id = ""  # 当前 assistant 消息 ID。
         self._turn_counter = 0  # turn 计数器。
         self._current_turn_id = ""  # 当前处理中的 turn ID。
-        self._pending_control_messages: list[ControlMessage] = []  # 待注入的控制消息。
-        self._tool_activity_in_run = False  # 本轮是否发生过工具调用。
-        self._follow_up_sent = False  # 本轮是否已经发出 follow-up。
         self.runtime = self._assemble_runtime(provider_registry=registry)  # 当前 session 装配出的运行时组件。
         self.compaction: CompactionCoordinator = self.runtime.compaction  # 上下文压缩协调器。
         self._stream_fn = stream_fn  # 自定义底层流式函数。
@@ -96,8 +93,6 @@ class AgentSession:
             tools=self.runtime.tools,
             stream=self._stream_fn,
             convert_to_llm=self._convert_to_llm,
-            steer=self._steer,
-            followUp=self._follow_up,
             beforeToolCall=self._before_tool_call,
             afterToolCall=self._after_tool_call,
             registry=self.runtime.provider_registry,
@@ -127,34 +122,62 @@ class AgentSession:
     def _convert_to_llm(self, messages: list[Any], state) -> list[ConversationMessage]:
         """把 runtime 消息列表转换成真正送给模型的对话上下文。"""
 
-        llm_messages: list[ConversationMessage] = []
-        for message in messages:
-            if isinstance(message, ControlMessage):
-                metadata = {"control": True, "kind": message.kind, **dict(message.metadata)}
-                if message.kind == "follow_up":
-                    metadata["follow_up"] = True
-                if message.kind == "steering":
-                    metadata["steering"] = True
-                llm_messages.append(UserMessage(content=message.content, metadata=metadata))
-                continue
-            if isinstance(message, (AssistantMessage, ToolResultMessage, UserMessage)):
-                llm_messages.append(message)
-        return llm_messages
+        _ = state
+        return [message for message in messages if isinstance(message, (AssistantMessage, ToolResultMessage, UserMessage))]
+
+    @property
+    def isStreaming(self) -> bool:
+        """返回当前会话是否正在运行。"""
+
+        return self._agent.isRunning
+
+    def _next_turn_id(self) -> str:
+        """分配一个新的 turn 标识。"""
+
+        self._turn_counter += 1
+        self._current_turn_id = f"turn-{self._turn_counter}"
+        return self._current_turn_id
+
+    def _make_user_message(self, content: str, *, turn_id: str) -> UserMessage:
+        """创建一条带运行期 turn 标识的用户消息。"""
+
+        return UserMessage(content=content, metadata={"turn_id": turn_id})
 
     def send_user_message(self, content: str) -> None:
         """接收用户输入，写入会话存储并加入待发送队列。"""
 
-        self._turn_counter += 1
-        self._current_turn_id = f"turn-{self._turn_counter}"
-        message = UserMessage(content=content)
-        self.session_manager.append_message(
-            self.session_id,
-            message=message,
-            branch_id=self.branch_id,
-            parent_id=self.last_node_id,
-        )
-        self.last_node_id = self.session_manager.load_session(self.session_id).nodes[-1].id
-        self._agent.enqueue(message)
+        turn_id = self._next_turn_id()
+        self._agent.enqueue(self._make_user_message(content, turn_id=turn_id))
+
+    def prompt(self, content: str, *, streaming_behavior: str | None = None) -> None:
+        """统一处理普通输入与 streaming 期间的排队输入。"""
+
+        if self.isStreaming:
+            if streaming_behavior == "steer":
+                self.steer(content)
+                return
+            if streaming_behavior in {"follow_up", "followUp"}:
+                self.follow_up(content)
+                return
+            raise RuntimeError("Agent is already processing. Specify streaming_behavior='steer' or 'follow_up'.")
+        self.send_user_message(content)
+
+    def steer(self, content: str) -> None:
+        """把用户消息排入 steering 队列。"""
+
+        turn_id = self._next_turn_id()
+        self._agent.enqueueSteering(self._make_user_message(content, turn_id=turn_id))
+
+    def follow_up(self, content: str) -> None:
+        """把用户消息排入 follow-up 队列。"""
+
+        turn_id = self._next_turn_id()
+        self._agent.enqueueFollowUp(self._make_user_message(content, turn_id=turn_id))
+
+    def followUp(self, content: str) -> None:
+        """兼容驼峰命名的 follow-up 入口。"""
+
+        self.follow_up(content)
 
     @property
     def current_turn_id(self) -> str:
@@ -227,9 +250,6 @@ class AgentSession:
     async def run_turn(self) -> AsyncIterator[SessionEvent]:
         """运行一轮会话，并把底层事件映射为 UI 事件流。"""
 
-        self._pending_control_messages.clear()
-        self._tool_activity_in_run = False
-        self._follow_up_sent = False
         attempt = 0
         while True:
             try:
@@ -266,12 +286,23 @@ class AgentSession:
         async for event in session.consume():
             for mapped in self._map_event(event):
                 yield mapped
+            if event.type == "message_end" and isinstance(event.message, UserMessage):
+                self._persist_user_message(event.message)
             if event.type == "message_end" and isinstance(event.message, AssistantMessage):
                 self._persist_assistant(event.message)
-            if event.type == "message_end" and isinstance(event.message, ControlMessage):
-                self._persist_control_message(event.message)
             if event.type == "tool_execution_end" and event.toolResult is not None:
                 self._persist_tool_result(event.toolResult)
+
+    def _persist_user_message(self, message: UserMessage) -> None:
+        """把用户消息持久化为会话节点。"""
+
+        node = self.session_manager.append_message(
+            self.session_id,
+            message=UserMessage(content=message.content),
+            branch_id=self.branch_id,
+            parent_id=self.last_node_id,
+        )
+        self.last_node_id = node.id
 
     def _persist_assistant(self, message: AssistantMessage) -> None:
         """把 assistant 消息持久化为会话节点。"""
@@ -295,23 +326,13 @@ class AgentSession:
         )
         self.last_node_id = node.id
 
-    def _persist_control_message(self, message: ControlMessage) -> None:
-        """把 steering 或 follow-up 控制消息作为显式 control 事件持久化。"""
-
-        node = self.session_manager.append_control(
-            self.session_id,
-            message=message,
-            branch_id=self.branch_id,
-            parent_id=self.last_node_id,
-        )
-        self.last_node_id = node.id
-
     def _map_event(self, event: AgentEvent) -> list[SessionEvent]:
         """把 `agent_core` 事件转换成交互层事件。"""
 
         events: list[SessionEvent] = []
         if event.type == "message_start":
-            if isinstance(event.message, ControlMessage):
+            if isinstance(event.message, UserMessage):
+                self._current_turn_id = str(getattr(event.message, "metadata", {}).get("turn_id", self._current_turn_id or ""))
                 return events
             if event.message is not None and not isinstance(event.message, AssistantMessage):
                 return events
@@ -343,22 +364,9 @@ class AgentSession:
                     render_order=400,
                 )
             ]
-        if event.type == "message_end" and isinstance(event.message, ControlMessage):
-            source = "follow_up" if event.message.kind == "follow_up" else "steering"
-            message = event.message.content if event.message.kind != "follow_up" else "正在基于工具结果继续整理最终答复"
-            return [
-                SessionEvent(
-                    type="status",
-                    message=message,
-                    panel="status",
-                    status_level="info",
-                    turn_id=self._current_turn_id,
-                    source=source,
-                    render_group="pre_assistant",
-                    render_order=320 if source == "follow_up" else 220,
-                    payload={"source": source},
-                )
-            ]
+        if event.type == "message_end" and isinstance(event.message, UserMessage):
+            self._current_turn_id = str(getattr(event.message, "metadata", {}).get("turn_id", self._current_turn_id or ""))
+            return events
         if event.type == "message_end" and isinstance(event.message, AssistantMessage):
             if event.message.thinking:
                 events.append(
@@ -466,62 +474,16 @@ class AgentSession:
         )
         self.compaction.maybe_compact_for_threshold(self.session_id, self.branch_id, self.model, context)
 
-    async def _steer(self, state, signal=None) -> list[Any]:
-        """在工具执行轮次之间注入 steering 控制消息。"""
-
-        _ = state, signal
-        messages = [replace(message) for message in self._pending_control_messages if message.kind == "steering"]
-        self._pending_control_messages = [message for message in self._pending_control_messages if message.kind != "steering"]
-        return messages
-
-    async def _follow_up(self, state, signal=None) -> list[Any]:
-        """在 AI 暂时完成工作后注入 follow-up 控制消息。"""
-
-        _ = signal
-        pending = [replace(message) for message in self._pending_control_messages if message.kind == "follow_up"]
-        if pending:
-            self._pending_control_messages = [message for message in self._pending_control_messages if message.kind != "follow_up"]
-            self._follow_up_sent = True
-            return pending
-        if not self._tool_activity_in_run or self._follow_up_sent:
-            return []
-        last_message = state.messages[-1] if state.messages else None
-        if not isinstance(last_message, AssistantMessage) or last_message.toolCalls:
-            return []
-        self._follow_up_sent = True
-        return [
-            ControlMessage(
-                kind="follow_up",
-                content="请基于当前工具执行结果给出最终答复；如果任务尚未完成，请继续推进并明确下一步。",
-                metadata={"phase": "follow_up"},
-            )
-        ]
-
     async def _before_tool_call(self, context: BeforeToolCallContext):
-        """在工具调用前排入 steering 控制消息。"""
+        """在工具调用前允许执行，并把可见性留给工具事件。"""
 
-        self._tool_activity_in_run = True
-        self._pending_control_messages.append(
-            ControlMessage(
-                kind="steering",
-                content=f"[Steering] 即将执行工具 `{context.toolCall.name}`，参数如下：\n{context.arguments}",
-                metadata={"phase": "before_tool", "tool_name": context.toolCall.name},
-            )
-        )
+        _ = context
         return BeforeToolCallAllow()
 
     async def _after_tool_call(self, context: AfterToolCallContext):
-        """在工具调用后排入 steering 控制消息，并为最终总结启用 follow-up。"""
+        """在工具调用后继续流程，不自动插入 follow-up。"""
 
-        self._tool_activity_in_run = True
-        self._pending_control_messages.append(
-            ControlMessage(
-                kind="steering",
-                content=f"[Steering] 工具 `{context.toolCall.name}` 已执行完成，请结合工具结果继续工作。",
-                metadata={"phase": "after_tool", "tool_name": context.toolCall.name},
-            )
-        )
-        self._follow_up_sent = False
+        _ = context
         return AfterToolCallPass()
 
     @staticmethod

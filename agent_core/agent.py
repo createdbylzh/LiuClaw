@@ -340,6 +340,14 @@ class Agent:
     async def continueConversation(self) -> StreamSession[AgentEvent]:
         """从当前上下文继续对话，不添加新消息。"""
 
+        if self.state.messages and isinstance(self.state.messages[-1], AssistantMessage):
+            queued_steering = self.dequeueSteeringAll()
+            if queued_steering:
+                return await self._runLoopSession(newMessages=queued_steering)
+            queued_follow_up = self.dequeueFollowUpAll()
+            if queued_follow_up:
+                return await self._runLoopSession(newMessages=queued_follow_up)
+            raise ValueError("Agent.continueConversation cannot continue from an assistant message without queued messages")
         return await self._runLoopSession(continueOnly=True)
 
     async def resume(self) -> StreamSession[AgentEvent]:

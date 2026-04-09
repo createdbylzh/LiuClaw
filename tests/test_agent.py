@@ -118,6 +118,19 @@ async def test_agent_continue_conversation_uses_current_state(stub_model: Model)
 
 
 @pytest.mark.asyncio
+async def test_agent_continue_conversation_consumes_queued_messages_from_assistant_tail(stub_model: Model) -> None:
+    agent = Agent(AgentOptions(loop=make_loop(stub_model)))
+    await collect_events(await agent.prompt(UserMessage(content="hello")))
+    agent.enqueueSteering(UserMessage(content="queued-steer"))
+
+    session = await agent.continueConversation()
+    events = await collect_events(session)
+
+    assert events[-1].state.history[-2].content == "queued-steer"
+    assert events[-1].state.history[-1].content == "echo:queued-steer"
+
+
+@pytest.mark.asyncio
 async def test_agent_run_uses_queue_when_pending_messages_exist(stub_model: Model) -> None:
     agent = Agent(AgentOptions(loop=make_loop(stub_model)))
     agent.enqueue(UserMessage(content="queued"))
