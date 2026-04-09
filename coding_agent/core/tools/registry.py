@@ -14,6 +14,7 @@ class ToolRegistry:
     def __init__(
         self,
         workspace_root: Path,
+        cwd: Path,
         settings: CodingAgentSettings,
         *,
         security_policy: ToolSecurityPolicy | None = None,
@@ -21,6 +22,7 @@ class ToolRegistry:
         """初始化工具注册表。"""
 
         self.workspace_root = workspace_root
+        self.cwd = cwd
         self.settings = settings
         self.security_policy = security_policy
         self._definitions: dict[str, ToolDefinition] = {}
@@ -55,7 +57,7 @@ class ToolRegistry:
     def activate_all(self) -> list[AgentTool]:
         """构造并激活全部工具定义。"""
 
-        self._active_tools = [self._wrap_tool(definition, definition.builder(self.workspace_root, self.settings)) for definition in self.definitions]
+        self._active_tools = [self._wrap_tool(definition, definition.builder(self.workspace_root, self.cwd, self.settings)) for definition in self.definitions]
         return self.active_tools
 
     def render_markdown(self) -> str:
@@ -91,7 +93,7 @@ class ToolRegistry:
             execution_context = ToolExecutionContext(
                 tool_name=tool.name,
                 workspace_root=self.workspace_root,
-                cwd=self.workspace_root,
+                cwd=self.cwd,
                 arguments=payload,
                 mode=definition.mode,
             )

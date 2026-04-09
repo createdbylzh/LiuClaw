@@ -16,9 +16,11 @@ from coding_agent.core.agent_session import AgentSession
 from coding_agent.core.compaction import SessionCompactor
 from coding_agent.core.model_registry import ModelRegistry
 from coding_agent.core.resource_loader import ResourceLoader
+from coding_agent.core.system_prompt import build_system_prompt
 from coding_agent.core.session_manager import SessionManager
 from coding_agent.core.settings_manager import SettingsManager
 from coding_agent.core.tools import build_default_tools, build_tool_registry
+from coding_agent.core.runtime_assembly import build_session_context
 from coding_agent.core.types import CodingAgentSettings, ControlMessage, SessionEvent, ToolPolicy
 from coding_agent.modes.interactive.controller import InteractiveController
 from coding_agent.modes.interactive.renderer import InteractiveRenderer
@@ -79,7 +81,7 @@ def test_resource_loader_and_conflict_detection(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (paths.skills_dir / "demo").mkdir(parents=True)
-    (paths.skills_dir / "demo" / "SKILL.md").write_text("# Skill\nbody", encoding="utf-8")
+    (paths.skills_dir / "demo" / "SKILL.md").write_text("---\nname: demo\ndescription: Demo skill\n---\n# Skill\nbody\n", encoding="utf-8")
     (paths.prompts_dir / "SYSTEM.md").write_text("custom prompt", encoding="utf-8")
     (workspace / "AGENTS.md").write_text("project context", encoding="utf-8")
 
@@ -92,6 +94,7 @@ def test_resource_loader_and_conflict_detection(tmp_path: Path) -> None:
     ).load()
 
     assert bundle.skills[0].name == "demo"
+    assert bundle.skills[0].description == "Demo skill"
     assert bundle.prompts["SYSTEM"].content == "custom prompt"
     assert bundle.agents_context == "project context"
 
@@ -104,6 +107,36 @@ def test_resource_loader_and_conflict_detection(tmp_path: Path) -> None:
             extensions_dir=paths.extensions_dir,
             workspace_root=workspace,
         ).load()
+
+
+def test_resource_loader_skips_invalid_skills(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    paths = build_agent_paths(root)
+    paths.ensure_exists()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (paths.skills_dir / "valid-skill").mkdir(parents=True)
+    (paths.skills_dir / "valid-skill" / "SKILL.md").write_text(
+        "---\nname: valid-skill\ndescription: Valid skill\n---\n# Valid\n",
+        encoding="utf-8",
+    )
+    (paths.skills_dir / "missing-description").mkdir(parents=True)
+    (paths.skills_dir / "missing-description" / "SKILL.md").write_text("---\nname: missing-description\n---\n# Invalid\n", encoding="utf-8")
+    (paths.skills_dir / "mismatch").mkdir(parents=True)
+    (paths.skills_dir / "mismatch" / "SKILL.md").write_text(
+        "---\nname: different-name\ndescription: mismatch\n---\n# Invalid\n",
+        encoding="utf-8",
+    )
+
+    bundle = ResourceLoader(
+        skills_dir=paths.skills_dir,
+        prompts_dir=paths.prompts_dir,
+        themes_dir=paths.themes_dir,
+        extensions_dir=paths.extensions_dir,
+        workspace_root=workspace,
+    ).load()
+
+    assert [skill.name for skill in bundle.skills] == ["valid-skill"]
 
 
 def test_session_manager_and_compaction(tmp_path: Path) -> None:
@@ -150,6 +183,13 @@ async def test_tools_and_agent_session_flow(tmp_path: Path, stub_model: Model) -
     bash_output = await tools["bash"].execute(json.dumps({"command": "printf world"}), None)
     assert "exit_code: 0" in bash_output
 
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside_file = outside_dir / "b.txt"
+    await tools["write"].execute(json.dumps({"path": str(outside_file), "content": "outside"}), None)
+    assert await tools["read"].execute(json.dumps({"path": str(outside_file)}), None) == "outside"
+    assert str(outside_file) in await tools["find"].execute(json.dumps({"pattern": "b.txt", "path": str(outside_dir)}), None)
+
     home_root = tmp_path / "home"
     paths = build_agent_paths(home_root)
     paths.ensure_exists()
@@ -195,6 +235,45 @@ async def test_tools_and_agent_session_flow(tmp_path: Path, stub_model: Model) -
 
     assert any(event.type == "message_delta" for event in events)
     assert restored[-1].content == "echo:hello"
+
+
+def test_system_prompt_advertises_skill_descriptions_only(tmp_path: Path, stub_model: Model) -> None:
+    root = tmp_path / "root"
+    paths = build_agent_paths(root)
+    paths.ensure_exists()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (paths.skills_dir / "demo").mkdir(parents=True)
+    skill_path = paths.skills_dir / "demo" / "SKILL.md"
+    skill_path.write_text(
+        "---\nname: demo\ndescription: Query API specs\n---\n# Demo Skill\nsecret body\n",
+        encoding="utf-8",
+    )
+    resources = ResourceLoader(
+        skills_dir=paths.skills_dir,
+        prompts_dir=paths.prompts_dir,
+        themes_dir=paths.themes_dir,
+        extensions_dir=paths.extensions_dir,
+        workspace_root=workspace,
+    ).load()
+    registry = build_tool_registry(workspace, workspace, CodingAgentSettings(default_model=stub_model.id))
+    registry.activate_all()
+    context = build_session_context(
+        workspace_root=workspace,
+        cwd=workspace,
+        model=stub_model,
+        thinking="medium",
+        settings=CodingAgentSettings(default_model=stub_model.id),
+        resources=resources,
+        tool_registry=registry,
+    )
+
+    prompt = build_system_prompt(context)
+
+    assert "demo: Query API specs" in prompt
+    assert str(skill_path) in prompt
+    assert "secret body" not in prompt
+    assert "再使用 read 工具读取对应 SKILL.md" in prompt
 
 
 @pytest.mark.asyncio
@@ -801,7 +880,7 @@ def test_resource_loader_loads_python_extension_runtime_and_tool_registry(tmp_pa
         extensions_dir=paths.extensions_dir,
         workspace_root=workspace,
     ).load()
-    registry = build_tool_registry(workspace, CodingAgentSettings(default_model=stub_model.id))
+    registry = build_tool_registry(workspace, workspace, CodingAgentSettings(default_model=stub_model.id))
     for tool in bundle.extension_runtime.tools:
         registry.register_tool(tool, source=tool.metadata.get("source", "extension"))
 

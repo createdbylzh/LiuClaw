@@ -9,7 +9,7 @@ from ..types import CodingAgentSettings
 from .common import run_shell, truncate_text
 
 
-def build_bash_tool(workspace_root: Path, settings: CodingAgentSettings) -> AgentTool:
+def build_bash_tool(workspace_root: Path, cwd: Path, settings: CodingAgentSettings) -> AgentTool:
     """构造执行 shell 命令的内置工具。"""
 
     async def execute(arguments: str, context) -> str:
@@ -19,7 +19,7 @@ def build_bash_tool(workspace_root: Path, settings: CodingAgentSettings) -> Agen
             raise ValueError("bash tool is disabled by settings")
         payload = json.loads(arguments or "{}")
         command = str(payload["command"])
-        completed = run_shell(command, workspace_root)
+        completed = run_shell(command, cwd)
         output = "\n".join(
             [
                 f"$ {command}",
@@ -34,7 +34,7 @@ def build_bash_tool(workspace_root: Path, settings: CodingAgentSettings) -> Agen
 
     return AgentTool(
         name="bash",
-        description="Run a non-interactive shell command in the workspace.",
+        description="Run a non-interactive shell command in the current working directory.",
         inputSchema={"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
         execute=execute,
     )

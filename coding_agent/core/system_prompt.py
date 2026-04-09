@@ -8,7 +8,7 @@ from .types import SessionContext
 BEHAVIOR_RULES = """行为准则：
 - 你是终端中的编码助手，优先给出可执行的工程动作
 - 调用工具前先想清楚最小必要范围
-- 写文件前确保路径在工作区内
+- 只有当用户请求与某个 skill 的 description 匹配时，才去读取对应的 SKILL.md
 - 输出简洁、明确，并在需要时说明假设
 """
 
@@ -20,14 +20,13 @@ def _build_tools_markdown(tools_markdown: str) -> str:
 
 
 def _build_skills_markdown(context: SessionContext) -> str:
-    """把已加载技能压缩成适合放入系统提示的摘要。"""
+    """把已发现技能压缩成适合放入系统提示的摘要。"""
 
     if not context.resources.skills:
         return "技能：无"
-    lines = ["技能："]
+    lines = ["技能：", "当任务与某个技能描述匹配时，再使用 read 工具读取对应 SKILL.md："]
     for skill in context.resources.skills:
-        preview = skill.content.strip().splitlines()[0] if skill.content.strip() else ""
-        lines.append(f"- {skill.name}: {preview}")
+        lines.append(f"- {skill.name}: {skill.description} ({skill.path})")
     return "\n".join(lines)
 
 

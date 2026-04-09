@@ -43,7 +43,7 @@ def assemble_session_runtime(
     """装配 AgentSession 需要的 runtime 组件。"""
 
     resources = resource_loader.load()
-    tool_registry = build_tool_registry(workspace_root, settings)
+    tool_registry = build_tool_registry(workspace_root, cwd, settings)
     tools = tool_registry.activate_all()
     for tool in resources.extension_runtime.tools:
         tool_registry.register_tool(tool, source=tool.metadata.get("source", "extension"), group=tool.metadata.get("group", "extension"), mode=tool.metadata.get("mode", "workspace-write"))

@@ -4,16 +4,10 @@ import subprocess
 from pathlib import Path
 
 
-def ensure_within_workspace(workspace_root: Path, target: Path) -> Path:
-    """校验目标路径位于工作区内，并返回其绝对路径。"""
+def resolve_path(cwd: Path, target: Path) -> Path:
+    """把绝对路径原样返回，相对路径按当前 cwd 解析。"""
 
-    root = workspace_root.resolve()
-    resolved = (target if target.is_absolute() else workspace_root / target).resolve()
-    try:
-        resolved.relative_to(root)
-    except ValueError as exc:
-        raise ValueError(f"Path escapes workspace: {resolved}") from exc
-    return resolved
+    return (target if target.is_absolute() else cwd / target).resolve()
 
 
 def truncate_text(text: str, limit: int) -> str:

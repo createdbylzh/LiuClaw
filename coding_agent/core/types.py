@@ -52,11 +52,11 @@ class CodingAgentSettings:
 
 @dataclass(slots=True)
 class SkillResource:
-    """表示一个已加载的技能资源。"""
+    """表示一个已发现的技能摘要。"""
 
     name: str
+    description: str
     path: Path
-    content: str
 
 
 @dataclass(slots=True)
@@ -143,7 +143,7 @@ class ToolDefinition:
 
     name: str
     description: str
-    builder: Callable[[Path, CodingAgentSettings], AgentTool]
+    builder: Callable[[Path, Path, CodingAgentSettings], AgentTool]
     group: str = "general"
     built_in: bool = False
     mode: ToolMode = "workspace-write"
