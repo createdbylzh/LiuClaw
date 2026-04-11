@@ -39,6 +39,7 @@ def assemble_session_runtime(
     session_manager: SessionManager,
     resource_loader: ResourceLoader,
     provider_registry: ProviderRegistry | None = None,
+    model_resolver=None,
 ) -> SessionRuntimeAssembly:
     """装配 AgentSession 需要的 runtime 组件。"""
 
@@ -52,7 +53,14 @@ def assemble_session_runtime(
     for name, factory in resources.extension_runtime.provider_factories.items():
         registry.register_factory(name, factory)
     prompt_builder = SystemPromptBuilder()
-    compaction = CompactionCoordinator(session_manager, settings)
+    compaction = CompactionCoordinator(
+        session_manager,
+        settings,
+        model=model,
+        thinking=thinking,
+        registry=registry,
+        model_resolver=model_resolver,
+    )
     listeners = list(resources.extension_runtime.event_listeners)
     _ = SessionContext(
         workspace_root=workspace_root,

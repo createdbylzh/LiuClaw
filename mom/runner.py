@@ -8,7 +8,7 @@ from typing import Any
 from ai import Model
 from agent_core import AfterToolCallPass, BeforeToolCallAllow
 from coding_agent.config.paths import AgentPaths
-from coding_agent.core import AgentSession, ResourceLoader, SessionManager
+from coding_agent.core import AgentSession, ModelRegistry, ResourceLoader, SessionManager
 from coding_agent.core.runtime_assembly import build_session_context
 from coding_agent.core.types import CodingAgentSettings, SessionEvent
 
@@ -111,6 +111,7 @@ class MomRunner:
         model: Model,
         settings: CodingAgentSettings,
         agent_paths: AgentPaths,
+        model_registry: ModelRegistry | None = None,
         session_ref: SessionRef,
         render_config: MomRenderConfig | None = None,
         stream_fn=None,
@@ -123,6 +124,7 @@ class MomRunner:
         self.model = model  # 当前模型。
         self.settings = settings  # 生效设置。
         self.agent_paths = agent_paths  # agent 级路径集合。
+        self.model_registry = model_registry  # 模型解析器。
         self.render_config = render_config or MomRenderConfig()  # mom 输出渲染配置。
         self.session_manager = SessionManager(store.paths.sessions_dir)  # 会话管理器。
         self.session_ref = session_ref  # 频道与会话的持久化引用。
@@ -147,6 +149,7 @@ class MomRunner:
             settings=settings,
             session_manager=self.session_manager,
             resource_loader=self.resource_loader,
+            model_registry=self.model_registry,
             session_id=session_ref.session_id,
             branch_id=session_ref.branch_id,
             stream_fn=stream_fn,
@@ -292,6 +295,7 @@ def get_or_create_runner(
     model: Model,
     settings: CodingAgentSettings,
     agent_paths: AgentPaths,
+    model_registry: ModelRegistry | None = None,
     session_ref: SessionRef,
     render_config: MomRenderConfig | None = None,
     stream_fn=None,
@@ -311,6 +315,7 @@ def get_or_create_runner(
         model=model,
         settings=settings,
         agent_paths=agent_paths,
+        model_registry=model_registry,
         session_ref=session_ref,
         render_config=render_config,
         stream_fn=stream_fn,

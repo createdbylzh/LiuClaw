@@ -51,7 +51,8 @@ class MomApp:
         self.agent_paths = build_agent_paths()
         self.agent_paths.ensure_exists()
         self.settings = SettingsManager(self.agent_paths.settings_file, config.workspace_root / ".LiuClaw" / "settings.json").load()
-        self.model = ModelRegistry(self.agent_paths.models_file).get(config.model_id or self.settings.default_model)
+        self.model_registry = ModelRegistry(self.agent_paths.models_file)
+        self.model = self.model_registry.get(config.model_id or self.settings.default_model)
         self.transport = transport or FeishuBotTransport(self, config.feishu)
         self.channel_states: dict[str, ChannelState] = {}
         self.events = EventsWatcher(self.store.paths.events_dir, self.handle_chat_event)
@@ -156,6 +157,7 @@ class MomApp:
                 model=self.model,
                 settings=self.settings,
                 agent_paths=self.agent_paths,
+                model_registry=self.model_registry,
                 session_ref=session_ref,
                 render_config=self.render_config,
                 stream_fn=self.stream_fn,

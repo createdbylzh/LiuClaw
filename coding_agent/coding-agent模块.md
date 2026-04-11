@@ -117,7 +117,7 @@ if __name__ == "__main__":
 - `auto_compact`
 - `compact_threshold`
 - `compact_keep_turns`
-- `compact_model`
+- `compact_model`：压缩摘要时优先使用的模型
 - `theme`
 - `system_prompt_override`
 - `tool_policy`
@@ -584,14 +584,18 @@ if __name__ == "__main__":
 - 摘要写入 `summary` 事件
 - 被摘要覆盖的旧节点在 `build_context_messages()` 中会被跳过
 
-摘要内容是规则生成的文本，不依赖额外模型调用，格式类似：
+摘要内容改为通过 `ai.completeSimple()` 调用大模型生成，而不是本地字符串拼接。实现上会：
 
-- 历史摘要
-- 用户: ...
-- 助手: ...
-- 工具: ...
+- 先把较早历史整理成稳定输入
+- 使用专用 system prompt 约束摘要结构
+- 只输出固定 5 段：
+  - `任务目标`
+  - `关键上下文`
+  - `已完成事项`
+  - `未完成事项`
+  - `风险与注意点`
 
-这是一种工程上更稳定、成本更低的压缩实现。
+摘要模型优先读取 `compact_model`，未配置时回退当前会话模型。这样压缩后的 summary 更适合后续继续任务，而不只是机械压缩聊天记录。
 
 ## 共享类型设计
 

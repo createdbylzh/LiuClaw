@@ -14,6 +14,7 @@ from coding_agent.cli import parse_args
 from coding_agent.config.paths import build_agent_paths, find_project_settings_file
 from coding_agent.core.agent_session import AgentSession
 from coding_agent.core.compaction import SessionCompactor
+from coding_agent.core.compaction import compactor as compactor_module
 from coding_agent.core.model_registry import ModelRegistry
 from coding_agent.core.resource_loader import ResourceLoader
 from coding_agent.core.system_prompt import build_system_prompt
@@ -139,7 +140,8 @@ def test_resource_loader_skips_invalid_skills(tmp_path: Path) -> None:
     assert [skill.name for skill in bundle.skills] == ["valid-skill"]
 
 
-def test_session_manager_and_compaction(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_session_manager_and_compaction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub_model: Model) -> None:
     manager = SessionManager(tmp_path / "sessions")
     snapshot = manager.create_session(cwd=tmp_path, model_id="openai:gpt-5")
     parent_id = None
@@ -159,14 +161,88 @@ def test_session_manager_and_compaction(tmp_path: Path) -> None:
         )
         parent_id = assistant.id
 
-    result = SessionCompactor(manager, keep_turns=1).compact_session(snapshot.session_id)
+    calls: list[dict] = []
+
+    async def fake_complete_simple(model, context, **kwargs):
+        calls.append({"model": model, "context": context, "kwargs": kwargs})
+        return AssistantMessage(
+            content=(
+                "任务目标\n- 总结历史\n"
+                "关键上下文\n- 已存在历史\n"
+                "已完成事项\n- 完成若干轮对话\n"
+                "未完成事项\n- 继续处理最新问题\n"
+                "风险与注意点\n- 注意历史可能被压缩"
+            )
+        )
+
+    monkeypatch.setattr(compactor_module, "completeSimple", fake_complete_simple)
+    runtime = compactor_module.CompactionRuntime(
+        model=stub_model,
+        thinking="medium",
+        settings=CodingAgentSettings(default_model=stub_model.id, compact_model="stub:test"),
+        model_resolver=lambda model_id: Model(
+            id=model_id,
+            provider="stub",
+            inputPrice=0.1,
+            outputPrice=0.2,
+            contextWindow=10000,
+            maxOutputTokens=1000,
+        ),
+    )
+
+    result = await SessionCompactor(manager, runtime, keep_turns=1).compact_session(snapshot.session_id)
     messages = manager.build_context_messages(snapshot.session_id)
 
     assert result.compacted_count == 6
     assert messages[0].metadata["summary"] is True
-    contents = [message.content for message in messages]
+    assert "任务目标" in str(messages[0].content)
+    contents = [str(message.content) for message in messages]
     assert "user-0" not in contents
     assert "assistant-3" in contents
+    assert calls[0]["model"].id == "stub:test"
+    assert "任务目标" in calls[0]["context"].systemPrompt
+
+
+@pytest.mark.asyncio
+async def test_compaction_returns_noop_when_summary_generation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stub_model: Model,
+) -> None:
+    manager = SessionManager(tmp_path / "sessions")
+    snapshot = manager.create_session(cwd=tmp_path, model_id=stub_model.id)
+    parent_id = None
+    for index in range(3):
+        user = manager.append_message(
+            snapshot.session_id,
+            message=UserMessage(content=f"user-{index}"),
+            branch_id=snapshot.branch_id,
+            parent_id=parent_id,
+        )
+        parent_id = user.id
+        assistant = manager.append_message(
+            snapshot.session_id,
+            message=AssistantMessage(content=f"assistant-{index}"),
+            branch_id=snapshot.branch_id,
+            parent_id=parent_id,
+        )
+        parent_id = assistant.id
+
+    async def fake_complete_simple(model, context, **kwargs):
+        _ = model, context, kwargs
+        raise RuntimeError("summary failed")
+
+    monkeypatch.setattr(compactor_module, "completeSimple", fake_complete_simple)
+    runtime = compactor_module.CompactionRuntime(
+        model=stub_model,
+        thinking="medium",
+        settings=CodingAgentSettings(default_model=stub_model.id),
+    )
+
+    result = await SessionCompactor(manager, runtime, keep_turns=1).compact_session(snapshot.session_id)
+
+    assert result.compacted_count == 0
+    assert manager.latest_summary(manager.load_session(snapshot.session_id), snapshot.branch_id) is None
 
 
 @pytest.mark.asyncio

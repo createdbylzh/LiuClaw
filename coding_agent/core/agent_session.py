@@ -39,6 +39,7 @@ class AgentSession:
         settings: CodingAgentSettings,
         session_manager: SessionManager,
         resource_loader: ResourceLoader,
+        model_registry=None,
         session_id: str | None = None,
         branch_id: str = "main",
         stream_fn=None,
@@ -53,6 +54,7 @@ class AgentSession:
         self.settings = settings  # 会话生效设置。
         self.session_manager = session_manager  # 会话持久化管理器。
         self.resource_loader = resource_loader  # 资源加载器。
+        self.model_registry = model_registry  # 可选模型解析器。
         self.session_id = session_id  # 当前会话 ID。
         self.branch_id = branch_id  # 当前分支 ID。
         self.last_node_id: str | None = None  # 最近写入的会话节点 ID。
@@ -81,6 +83,7 @@ class AgentSession:
             session_manager=self.session_manager,
             resource_loader=self.resource_loader,
             provider_registry=provider_registry,
+            model_resolver=self.model_registry,
         )
 
     def _build_agent(self) -> Agent:
@@ -220,13 +223,14 @@ class AgentSession:
         """调整当前会话的思考等级，并更新系统提示。"""
 
         self.thinking = thinking
+        self.compaction.compactor.runtime.thinking = thinking
         self._agent.setThinking(thinking)
         self._agent.setSystemPrompt(self._build_system_prompt())
 
-    def compact(self):
+    async def compact(self):
         """手动触发当前会话分支的上下文压缩。"""
 
-        return self.compaction.compact_manual(self.session_id, self.branch_id)
+        return await self.compaction.compact_manual(self.session_id, self.branch_id)
 
     def cancel(self) -> None:
         """取消当前运行中的 agent 循环。"""
@@ -256,7 +260,7 @@ class AgentSession:
                 async for event in self._run_turn_once():
                     overflow = self._extract_overflow_error(event)
                     if overflow and attempt == 0:
-                        recovered = self.compaction.recover_from_overflow(self.session_id, self.branch_id)
+                        recovered = await self.compaction.recover_from_overflow(self.session_id, self.branch_id)
                         if recovered is not None:
                             attempt += 1
                             self.resume_session()
@@ -266,7 +270,7 @@ class AgentSession:
                     return
             except Exception as exc:
                 if attempt == 0 and self._is_context_overflow_error(str(exc)):
-                    recovered = self.compaction.recover_from_overflow(self.session_id, self.branch_id)
+                    recovered = await self.compaction.recover_from_overflow(self.session_id, self.branch_id)
                     if recovered is not None:
                         attempt += 1
                         self.resume_session()
@@ -280,7 +284,9 @@ class AgentSession:
             session = await self._agent.continueConversation()
         else:
             self.resume_session()
-            self._maybe_auto_compact()
+            compacted = await self._maybe_auto_compact()
+            if compacted is not None:
+                self.resume_session()
             session = await self._agent.run()
 
         async for event in session.consume():
@@ -461,7 +467,7 @@ class AgentSession:
             ]
         return events
 
-    def _maybe_auto_compact(self) -> None:
+    async def _maybe_auto_compact(self):
         """在发送请求前根据上下文大小决定是否自动压缩。"""
 
         context = build_runtime_context_messages(
@@ -472,7 +478,7 @@ class AgentSession:
             self._build_system_prompt(),
             self.runtime.tools,
         )
-        self.compaction.maybe_compact_for_threshold(self.session_id, self.branch_id, self.model, context)
+        return await self.compaction.maybe_compact_for_threshold(self.session_id, self.branch_id, self.model, context)
 
     async def _before_tool_call(self, context: BeforeToolCallContext):
         """在工具调用前允许执行，并把可见性留给工具事件。"""

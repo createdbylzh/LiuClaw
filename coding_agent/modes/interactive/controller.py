@@ -134,6 +134,7 @@ class InteractiveController:
                 settings=self.session.settings,
                 session_manager=self.session_manager,
                 resource_loader=self.session.resource_loader,
+                model_registry=self.session.model_registry,
             )
             self.state.clear_output()
             if hasattr(self.renderer, "sync_transcript"):
@@ -167,7 +168,7 @@ class InteractiveController:
             self.session.set_thinking(args[0])
             self.state.add_status(f"思考等级已切换为 {args[0]}")
         elif command == "/compact":
-            result = self.session.compact()
+            result = await self.session.compact()
             self.state.add_status(f"已压缩 {result.compacted_count} 条历史消息")
         elif command == "/theme":
             if not args:

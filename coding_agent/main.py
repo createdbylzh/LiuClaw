@@ -38,12 +38,13 @@ def main(argv: list[str] | None = None) -> int:
         settings=settings,
         session_manager=session_manager,
         resource_loader=resource_loader,
+        model_registry=registry,
         session_id=None if args.new else args.session,
     )
     if args.session:
         session.resume_session()
     if args.compact:
-        session.compact()
+        asyncio.run(session.compact())
         return 0
     if args.prompt:
         async def _run_prompt() -> int:
