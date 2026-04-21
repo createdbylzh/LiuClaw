@@ -59,39 +59,49 @@ Use this exact format:
 
 @dataclass(slots=True)
 class CompactionRuntime:
-    model: Model
-    thinking: str | None
-    settings: Any
-    registry: ProviderRegistry | None = None
-    model_resolver: Any | None = None
+    """定义压缩流程运行时所依赖的模型与配置。"""
+
+    model: Model  # 当前默认压缩所使用的模型。
+    thinking: str | None  # 压缩调用时使用的 thinking 级别。
+    settings: Any  # 生效中的全局设置对象。
+    registry: ProviderRegistry | None = None  # provider 注册表。
+    model_resolver: Any | None = None  # 可选的模型解析器。
 
 
 @dataclass(slots=True)
 class CutPointResult:
-    first_kept_index: int
-    turn_start_index: int
-    is_split_turn: bool
+    """描述压缩切点以及是否切开了一个未完成 turn。"""
+
+    first_kept_index: int  # 压缩后第一个保留条目的索引。
+    turn_start_index: int  # 若切开 turn，则该 turn 起点索引。
+    is_split_turn: bool  # 是否切开了一个 turn。
 
 
 @dataclass(slots=True)
 class CompactionPreparation:
-    first_kept_entry_id: str
-    messages_to_summarize: list[ConversationMessage]
-    turn_prefix_messages: list[ConversationMessage]
-    is_split_turn: bool
-    tokens_before: int
-    previous_summary: str | None
-    details: dict[str, Any]
+    """保存一次压缩前分析得到的中间结果。"""
+
+    first_kept_entry_id: str  # 压缩边界之后第一个保留条目 ID。
+    messages_to_summarize: list[ConversationMessage]  # 需要主摘要压缩的消息。
+    turn_prefix_messages: list[ConversationMessage]  # 若切开 turn，需要额外摘要的前缀消息。
+    is_split_turn: bool  # 是否发生了 turn 级别切分。
+    tokens_before: int  # 压缩前估算的 token 数。
+    previous_summary: str | None  # 之前已有的压缩摘要。
+    details: dict[str, Any]  # 附加细节，如读写文件信息。
 
 
 class SessionCompactor:
     """负责选择旧消息并生成会话摘要。"""
 
     def __init__(self, session_manager: SessionManager, runtime: CompactionRuntime) -> None:
+        """初始化压缩器，并绑定会话管理器与运行时配置。"""
+
         self.session_manager = session_manager
         self.runtime = runtime
 
     async def compact_session(self, session_ref: str, leaf_id: str | None = None, custom_instructions: str | None = None) -> CompactResult:
+        """对指定会话分支执行一次完整的上下文压缩。"""
+
         snapshot = self.session_manager.load_session(session_ref)
         path_entries = self.session_manager.get_branch(snapshot.session_file, leaf_id)
         preparation = self.prepare_compaction(path_entries, self.runtime.settings.compaction)
@@ -117,6 +127,8 @@ class SessionCompactor:
         )
 
     def prepare_compaction(self, path_entries: list[SessionEntry], settings: CompactionSettings) -> CompactionPreparation | None:
+        """分析当前分支，决定压缩边界与待摘要消息。"""
+
         if path_entries and path_entries[-1].type == "compaction":
             return None
 
@@ -154,6 +166,8 @@ class SessionCompactor:
         )
 
     def find_cut_point(self, entries: list[SessionEntry], start_index: int, end_index: int, keep_recent_tokens: int) -> CutPointResult:
+        """根据保留 token 预算计算压缩切点。"""
+
         message_indexes = [index for index in range(start_index, end_index) if entries[index].type == "message"]
         if not message_indexes:
             return CutPointResult(first_kept_index=start_index, turn_start_index=-1, is_split_turn=False)
@@ -177,6 +191,8 @@ class SessionCompactor:
         return CutPointResult(first_kept_index=cut_index, turn_start_index=turn_start_index, is_split_turn=not is_user_message and turn_start_index != -1)
 
     async def _generate_compaction_summary(self, preparation: CompactionPreparation, custom_instructions: str | None = None) -> str:
+        """根据压缩准备结果生成最终摘要文本。"""
+
         history_summary = await self._summarize_messages(preparation.messages_to_summarize, custom_instructions, preparation.previous_summary)
         if preparation.is_split_turn and preparation.turn_prefix_messages:
             turn_prefix = await self._summarize_turn_prefix(preparation.turn_prefix_messages)
@@ -191,6 +207,8 @@ class SessionCompactor:
         custom_instructions: str | None,
         previous_summary: str | None,
     ) -> str:
+        """调用摘要模型，将旧消息压缩成结构化 checkpoint。"""
+
         if not messages and not previous_summary:
             return "## Goal\n暂无\n\n## Constraints & Preferences\n- (none)\n\n## Progress\n### Done\n- [x] (none)\n\n### In Progress\n- [ ] (none)\n\n### Blocked\n- (none)\n\n## Key Decisions\n- **None**: no prior decisions recorded\n\n## Next Steps\n1. Continue from the retained recent context\n\n## Critical Context\n- (none)"
         history_text = self._serialize_messages(messages)
@@ -209,6 +227,8 @@ class SessionCompactor:
         return str(message.content).strip()
 
     async def _summarize_turn_prefix(self, messages: list[ConversationMessage]) -> str:
+        """为被截断 turn 的前半段单独生成补充上下文摘要。"""
+
         prompt = f"<conversation>\n{self._serialize_messages(messages)}\n</conversation>\n\n{TURN_PREFIX_PROMPT}"
         message = await completeSimple(
             self._resolve_summary_model(),
@@ -219,6 +239,8 @@ class SessionCompactor:
         return str(message.content).strip()
 
     def _resolve_summary_model(self) -> Model:
+        """解析压缩专用模型；若未配置则回退到当前模型。"""
+
         compact_model = self.runtime.settings.compaction.compact_model or self.runtime.settings.compact_model
         if compact_model and self.runtime.model_resolver is not None:
             resolver = self.runtime.model_resolver
@@ -226,6 +248,8 @@ class SessionCompactor:
         return self.runtime.model
 
     def _serialize_messages(self, messages: list[ConversationMessage]) -> str:
+        """将消息列表序列化为适合送给摘要模型的文本。"""
+
         lines: list[str] = []
         for message in messages:
             if isinstance(message, UserMessage):
@@ -241,6 +265,8 @@ class SessionCompactor:
         return "\n---\n".join(lines)
 
     def _messages_from_entries(self, entries: list[SessionEntry], include_compactions: bool = True) -> list[ConversationMessage]:
+        """将会话条目转换为消息列表，可选择包含摘要占位消息。"""
+
         messages: list[ConversationMessage] = []
         for entry in entries:
             if isinstance(entry, SessionMessageEntry):
@@ -252,11 +278,15 @@ class SessionCompactor:
         return messages
 
     def _estimate_entry_tokens(self, entry: SessionEntry) -> int:
+        """粗略估算单个条目的 token 占用。"""
+
         if not isinstance(entry, SessionMessageEntry):
             return max(1, len(json.dumps(entry.details if hasattr(entry, "details") else asdict(entry), ensure_ascii=False)) // 3)  # type: ignore[name-defined]
         return estimate_context_tokens(Context(messages=[entry.message]))
 
     def _find_turn_start(self, entries: list[SessionEntry], cut_index: int, start_index: int) -> int:
+        """从切点向前寻找当前 turn 的起始用户消息。"""
+
         for index in range(cut_index, start_index - 1, -1):
             entry = entries[index]
             if isinstance(getattr(entry, "message", None), UserMessage):
@@ -264,6 +294,8 @@ class SessionCompactor:
         return -1
 
     def _extract_file_details(self, messages: list[ConversationMessage]) -> dict[str, Any]:
+        """从工具调用历史中提取读写文件明细。"""
+
         read_files: set[str] = set()
         modified_files: set[str] = set()
         for message in messages:
@@ -281,6 +313,8 @@ class SessionCompactor:
         return {"readFiles": sorted(read_files), "modifiedFiles": sorted(modified_files)}
 
     def _format_file_details(self, details: dict[str, Any]) -> str:
+        """将文件读写明细格式化到摘要尾部。"""
+
         read_files = details.get("readFiles", [])
         modified_files = details.get("modifiedFiles", [])
         parts: list[str] = []
